@@ -1,3 +1,6 @@
 name = "gh"
 main = "workers.js"
 compatibility_date = "2026-07-17"
+
+# 单 Worker 架构：使用 cloudflare:sockets connect() API 绕过 SSL 525
+# 无需 Service Binding，所有功能在单个 Worker 中完成
