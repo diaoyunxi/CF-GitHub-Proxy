@@ -3,7 +3,12 @@
 /**
  * CF-Workers-GitHub-Proxy
  * 基于 Cloudflare Workers 的 GitHub 加速代理
- * 修复 SSL 525 错误：手动处理重定向 + 清理请求头 + cf 缓存选项
+ *
+ * 修复 SSL 525 错误方案：
+ * Cloudflare Worker 自定义域名 fetch github.com 会触发 TLS 兼容性问题（525），
+ * 但 workers.dev 域名不受影响。
+ * 因此：自定义域名的请求转发到 workers.dev 中继，workers.dev 直接 fetch GitHub。
+ * raw.githubusercontent.com 等域名不受影响，任何地方都直接 fetch。
  */
 
 /**
@@ -18,6 +23,18 @@ const Config = {
 }
 
 const whiteList = [] // 白名单，路径里面有包含字符的才会通过，e.g. ['/username/']
+
+/**
+ * workers.dev 中继域名（Cloudflare 官方分配，非第三方镜像）
+ * 自定义域名 fetch github.com 会 525，但 workers.dev 不会
+ */
+const WORKERS_DEV_HOST = 'gh.diaoyunxi3878.workers.dev'
+
+/**
+ * 受 525 SSL 错误影响的 GitHub 域名
+ * 这些域名需要通过 workers.dev 中继
+ */
+const GITHUB_525_PATTERN = /^https:\/\/(?:github\.com|api\.github\.com|codeload\.github\.com)\//i
 
 /** @type {ResponseInit} */
 const PREFLIGHT_INIT = {
@@ -37,11 +54,9 @@ const exp4 = /^(?:https?:\/\/)?raw\.(?:githubusercontent|github)\.com\/.+?\/.+?\
 const exp5 = /^(?:https?:\/\/)?gist\.(?:githubusercontent|github)\.com\/.+?\/.+?\/.+$/i
 const exp6 = /^(?:https?:\/\/)?github\.com\/.+?\/.+?\/tags.*$/i
 const exp7 = /^(?:https?:\/\/)?api\.github\.com\/.*$/i
-// GitHub release 文件下载重定向目标域名
+// GitHub release 文件下载重定向目标域名（不受 525 影响）
 const exp8 = /^(?:https?:\/\/)?objects\.githubusercontent\.com\/.*$/i
 const exp9 = /^(?:https?:\/\/)?codeload\.github\.com\/.*$/i
-// GitHub general 下载域名
-const exp10 = /^(?:https?:\/\/)?(?:.+?\.)?github\.com\/.+?\/releases\/download\/.+$/i
 
 /**
  * @param {any} body
@@ -74,7 +89,7 @@ addEventListener('fetch', e => {
 
 
 function checkUrl(u) {
-    for (let i of [exp1, exp2, exp3, exp4, exp5, exp6, exp7, exp8, exp9, exp10]) {
+    for (let i of [exp1, exp2, exp3, exp4, exp5, exp6, exp7, exp8, exp9]) {
         if (u.search(i) === 0) {
             return true
         }
@@ -95,10 +110,20 @@ async function fetchHandler(e) {
     }
     // 诊断端点
     if (urlObj.pathname === '/__diag__') {
-        return diagnosticsHandler()
+        return diagnosticsHandler(urlObj.hostname)
     }
     // cfworker 会把路径中的 `//` 合并成 `/`
     path = urlObj.href.substr(urlObj.origin.length + PREFIX.length).replace(/^https?:\/+/, 'https://')
+
+    // 判断当前是否在 workers.dev 域名上
+    const isWorkersDev = urlObj.hostname.endsWith('.workers.dev')
+
+    // 中继逻辑：如果在自定义域名上，且请求目标受 525 影响，转发到 workers.dev
+    if (!isWorkersDev && GITHUB_525_PATTERN.test(path)) {
+        return relayToWorkersDev(path, req)
+    }
+
+    // 以下为直接处理逻辑（workers.dev 上或请求目标不受 525 影响的域名）
     if (path.search(exp7) === 0) {
         return httpHandler(req, path)
     } else if (path.search(exp1) === 0 || path.search(exp5) === 0 || path.search(exp6) === 0 || path.search(exp3) === 0 || path.search(exp4) === 0) {
@@ -121,20 +146,67 @@ async function fetchHandler(e) {
 
 
 /**
- * 诊断函数：测试从 Worker fetch 各个 GitHub 域名的连通性
+ * 中继到 workers.dev
+ * 自定义域名 → workers.dev → GitHub
+ * workers.dev 不受 525 SSL 错误影响
+ * @param {string} path - 请求路径（含目标 URL）
+ * @param {Request} req - 原始请求
  */
-async function diagnosticsHandler() {
+async function relayToWorkersDev(path, req) {
+    const relayUrl = `https://${WORKERS_DEV_HOST}/${path}`
+    const cleanHeaders = buildCleanHeaders(req.headers)
+
+    try {
+        const res = await fetch(relayUrl, {
+            method: req.method,
+            headers: cleanHeaders,
+            redirect: 'manual',
+        })
+        const resHdrNew = new Headers(res.headers)
+
+        // 处理 workers.dev 返回的重定向
+        if (resHdrNew.has('location')) {
+            let loc = resHdrNew.get('location')
+            if (checkUrl(loc)) {
+                resHdrNew.set('location', PREFIX + loc)
+            }
+        }
+
+        resHdrNew.set('access-control-expose-headers', '*')
+        resHdrNew.set('access-control-allow-origin', '*')
+        resHdrNew.delete('content-security-policy')
+        resHdrNew.delete('content-security-policy-report-only')
+        resHdrNew.delete('clear-site-data')
+
+        return new Response(res.body, {
+            status: res.status,
+            headers: resHdrNew,
+        })
+    } catch (err) {
+        return makeRes('relay error: ' + err.message + '\nURL: ' + relayUrl, 502)
+    }
+}
+
+
+/**
+ * 诊断函数：测试从 Worker fetch 各个 GitHub 域名的连通性
+ * @param {string} hostname - 当前请求的 hostname
+ */
+async function diagnosticsHandler(hostname) {
+    const isWorkersDev = hostname.endsWith('.workers.dev')
     const testUrls = [
         'https://github.com',
         'https://api.github.com',
+        'https://codeload.github.com',
         'https://raw.githubusercontent.com',
         'https://objects.githubusercontent.com',
-        'https://codeload.github.com',
-        'https://github.com/diaoyunxi/CF-GitHub-Proxy',
-        'https://api.github.com/repos/diaoyunxi/CF-GitHub-Proxy',
         'https://raw.githubusercontent.com/diaoyunxi/CF-GitHub-Proxy/main/README.md',
     ]
-    const results = []
+    // 如果在自定义域名上，也测试 workers.dev 中继
+    if (!isWorkersDev) {
+        testUrls.push(`https://${WORKERS_DEV_HOST}/`)
+    }
+    const results = [{ hostname, isWorkersDev }]
     for (const url of testUrls) {
         try {
             const res = await fetch(url, {
@@ -162,7 +234,6 @@ async function diagnosticsHandler() {
  */
 function buildCleanHeaders(reqHdrRaw) {
     const reqHdrNew = new Headers()
-    // 只保留必要的请求头
     const keepHeaders = ['accept', 'accept-encoding', 'accept-language', 'user-agent', 'range', 'if-modified-since', 'if-none-match']
     for (const key of keepHeaders) {
         const val = reqHdrRaw.get(key)
@@ -204,14 +275,12 @@ function httpHandler(req, pathname) {
     }
     const urlObj = newUrl(urlStr)
 
-    // 构建干净的请求头，避免 SSL 握手问题
     const reqHdrNew = buildCleanHeaders(reqHdrRaw)
 
     /** @type {RequestInit} */
     const reqInit = {
         method: req.method,
         headers: reqHdrNew,
-        // 使用 manual 模式手动处理重定向，确保每个重定向目标使用干净连接
         redirect: 'manual',
         body: req.body
     }
@@ -221,7 +290,7 @@ function httpHandler(req, pathname) {
 
 /**
  * 递归代理函数，手动跟随重定向
- * 每次重定向使用全新的干净请求头，避免 SSL 握手失败
+ * 每次重定向使用全新的干净请求头
  * @param {URL} urlObj
  * @param {RequestInit} reqInit
  * @param {number} redirectCount
@@ -243,20 +312,17 @@ async function proxy(urlObj, reqInit, redirectCount = 0, maxRedirects = 10) {
         // 处理重定向（3xx）
         if (status >= 300 && status < 400 && resHdrNew.has('location')) {
             let location = resHdrNew.get('location')
-            // 将相对路径转换为绝对路径
             const newUrlObj = newUrl(location)
             if (!newUrlObj) {
-                // 相对路径
                 const absoluteUrl = new URL(location, urlObj.href)
                 location = absoluteUrl.href
             } else {
                 location = newUrlObj.href
             }
 
-            // 递归处理重定向，使用全新的干净请求头
             const cleanHeaders = buildCleanHeaders(reqInit.headers instanceof Headers ? reqInit.headers : new Headers())
             const newReqInit = {
-                method: reqInit.method === 'HEAD' ? 'HEAD' : 'GET', // 重定向通常用 GET
+                method: reqInit.method === 'HEAD' ? 'HEAD' : 'GET',
                 headers: cleanHeaders,
                 redirect: 'manual',
             }
