@@ -1,5 +1,10 @@
 'use strict'
 
+/**
+ * CF-Workers-GitHub-Proxy (Snippets 版本)
+ * 修复 SSL 525 错误：手动处理重定向 + 清理请求头
+ */
+
 const ASSET_URL = 'https://geekertao.github.io/gh-proxy/'
 const PREFIX = '/'
 
@@ -25,10 +30,10 @@ const exp4 = /^(?:https?:\/\/)?raw\.(?:githubusercontent|github)\.com\/.+?\/.+?\
 const exp5 = /^(?:https?:\/\/)?gist\.(?:githubusercontent|github)\.com\/.+?\/.+?\/.+$/i
 const exp6 = /^(?:https?:\/\/)?github\.com\/.+?\/.+?\/tags.*$/i
 const exp7 = /^(?:https?:\/\/)?api\.github\.com\/.*$/i
-// 新增: GitHub release 文件下载重定向目标域名
+// GitHub release 文件下载重定向目标域名
 const exp8 = /^(?:https?:\/\/)?objects\.githubusercontent\.com\/.*$/i
 const exp9 = /^(?:https?:\/\/)?codeload\.github\.com\/.*$/i
-// 新增: GitHub general 下载域名
+// GitHub general 下载域名
 const exp10 = /^(?:https?:\/\/)?(?:.+?\.)?github\.com\/.+?\/releases\/download\/.+$/i
 
 function makeRes(body, status = 200, headers = {}) {
@@ -106,6 +111,24 @@ async function fetchHandler(req) {
     }
 }
 
+/**
+ * 构建干净的请求头，只保留必要的头部信息
+ * 移除可能导致 SSL 握手失败的 Cloudflare 内部头部
+ * @param {Headers} reqHdrRaw
+ * @returns {Headers}
+ */
+function buildCleanHeaders(reqHdrRaw) {
+    const reqHdrNew = new Headers()
+    const keepHeaders = ['accept', 'accept-encoding', 'accept-language', 'user-agent', 'range', 'if-modified-since', 'if-none-match']
+    for (const key of keepHeaders) {
+        const val = reqHdrRaw.get(key)
+        if (val) {
+            reqHdrNew.set(key, val)
+        }
+    }
+    return reqHdrNew
+}
+
 function httpHandler(req, pathname) {
     const reqHdrRaw = req.headers
 
@@ -114,8 +137,6 @@ function httpHandler(req, pathname) {
     ) {
         return new Response(null, PREFLIGHT_INIT)
     }
-
-    const reqHdrNew = new Headers(reqHdrRaw)
 
     let urlStr = pathname
     let flag = !Boolean(whiteList.length)
@@ -137,38 +158,60 @@ function httpHandler(req, pathname) {
 
     const urlObj = newUrl(urlStr)
 
+    // 构建干净的请求头，避免 SSL 握手问题
+    const reqHdrNew = buildCleanHeaders(reqHdrRaw)
+
     const reqInit = {
         method: req.method,
         headers: reqHdrNew,
-        // 使用 follow 模式让 Cloudflare fetch 直接处理重定向，避免 SSL 525 错误
-        redirect: 'follow',
+        // 使用 manual 模式手动处理重定向，确保每个重定向目标使用干净连接
+        redirect: 'manual',
         body: req.body
     }
 
-    return proxy(urlObj, reqInit)
+    return proxy(urlObj, reqInit, 0)
 }
 
-async function proxy(urlObj, reqInit) {
-    // 清理可能导致 SSL 握手问题的 Cloudflare 内部头
-    if (reqInit.headers instanceof Headers) {
-        reqInit.headers.delete('cf-connecting-ip')
-        reqInit.headers.delete('cf-ray')
-        reqInit.headers.delete('cf-visitor')
-        reqInit.headers.delete('cf-ipcountry')
+/**
+ * 递归代理函数，手动跟随重定向
+ * 每次重定向使用全新的干净请求头，避免 SSL 握手失败
+ * @param {URL} urlObj
+ * @param {RequestInit} reqInit
+ * @param {number} redirectCount
+ * @param {number} maxRedirects
+ */
+async function proxy(urlObj, reqInit, redirectCount = 0, maxRedirects = 10) {
+    if (!urlObj) {
+        return makeRes('Invalid URL', 400)
+    }
+    if (redirectCount >= maxRedirects) {
+        return makeRes('Too many redirects', 502)
     }
 
     try {
         const res = await fetch(urlObj.href, reqInit)
-
         const resHdrNew = new Headers(res.headers)
         const status = res.status
 
-        // 处理重定向（当 redirect: 'follow' 未生效时的兜底）
-        if (resHdrNew.has('location')) {
-            let loc = resHdrNew.get('location')
-            if (checkUrl(loc)) {
-                resHdrNew.set('location', PREFIX + loc)
+        // 处理重定向（3xx）
+        if (status >= 300 && status < 400 && resHdrNew.has('location')) {
+            let location = resHdrNew.get('location')
+            const newUrlObj = newUrl(location)
+            if (!newUrlObj) {
+                const absoluteUrl = new URL(location, urlObj.href)
+                location = absoluteUrl.href
+            } else {
+                location = newUrlObj.href
             }
+
+            // 递归处理重定向，使用全新的干净请求头
+            const cleanHeaders = buildCleanHeaders(reqInit.headers instanceof Headers ? reqInit.headers : new Headers())
+            const newReqInit = {
+                method: reqInit.method === 'HEAD' ? 'HEAD' : 'GET',
+                headers: cleanHeaders,
+                redirect: 'manual',
+            }
+            return proxy(newUrl(location), newReqInit, redirectCount + 1, maxRedirects)
         }
 
         resHdrNew.set('access-control-expose-headers', '*')
@@ -183,7 +226,6 @@ async function proxy(urlObj, reqInit) {
             headers: resHdrNew,
         })
     } catch (err) {
-        // 捕获 SSL 和网络错误，返回有意义的错误信息
         return makeRes('proxy error: ' + err.message + '\nURL: ' + urlObj.href, 502)
     }
 }
