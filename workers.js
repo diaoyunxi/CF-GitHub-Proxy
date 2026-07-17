@@ -93,6 +93,10 @@ async function fetchHandler(e) {
     if (path) {
         return Response.redirect('https://' + urlObj.host + PREFIX + path, 301)
     }
+    // 诊断端点
+    if (urlObj.pathname === '/__diag__') {
+        return diagnosticsHandler()
+    }
     // cfworker 会把路径中的 `//` 合并成 `/`
     path = urlObj.href.substr(urlObj.origin.length + PREFIX.length).replace(/^https?:\/+/, 'https://')
     if (path.search(exp7) === 0) {
@@ -113,6 +117,40 @@ async function fetchHandler(e) {
     } else {
         return fetch(ASSET_URL + path)
     }
+}
+
+
+/**
+ * 诊断函数：测试从 Worker fetch 各个 GitHub 域名的连通性
+ */
+async function diagnosticsHandler() {
+    const testUrls = [
+        'https://github.com',
+        'https://api.github.com',
+        'https://raw.githubusercontent.com',
+        'https://objects.githubusercontent.com',
+        'https://codeload.github.com',
+        'https://github.com/diaoyunxi/CF-GitHub-Proxy',
+        'https://api.github.com/repos/diaoyunxi/CF-GitHub-Proxy',
+        'https://raw.githubusercontent.com/diaoyunxi/CF-GitHub-Proxy/main/README.md',
+    ]
+    const results = []
+    for (const url of testUrls) {
+        try {
+            const res = await fetch(url, {
+                method: 'GET',
+                headers: { 'user-agent': 'Mozilla/5.0' },
+                redirect: 'manual',
+            })
+            results.push({ url, status: res.status, ok: res.ok })
+        } catch (err) {
+            results.push({ url, status: 'error', error: err.message })
+        }
+    }
+    return new Response(JSON.stringify(results, null, 2), {
+        status: 200,
+        headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' }
+    })
 }
 
 
