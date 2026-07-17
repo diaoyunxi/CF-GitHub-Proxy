@@ -2,5 +2,15 @@ name = "gh"
 main = "workers.js"
 compatibility_date = "2026-07-17"
 
+# CPU 时间限制：免费计划不支持配置，默认 10ms
+# 纯管道传输 CPU 消耗 < 1ms，不受此限制影响
+# 如需更高 CPU 限制，需升级到付费计划
+
+# 可观测性：启用日志收集，用于调试流式传输问题
+[observability]
+enabled = true
+
 # 单 Worker 架构：使用 cloudflare:sockets connect() API 绕过 SSL 525
 # 无需 Service Binding，所有功能在单个 Worker 中完成
+# HTTP/1.0 + 纯管道传输：避免 chunked 编码，CPU 消耗极低
+# Content-Encoding: identity：阻止 Cloudflare 边缘代理自动压缩大文件

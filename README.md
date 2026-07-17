@@ -18,12 +18,16 @@ GitHub release、archive、raw 文件、API 加速项目，**完整支持 git cl
 | `cloudflare:sockets` `connect()` | 绕过 Worker `fetch()` 对 github.com 的 SSL 525 错误 |
 | `fetch()` | 处理不受 525 影响的域名（`*.githubusercontent.com`），支持流式传输大文件 |
 | 混合传输 | 自动根据目标域名选择 socket 或 fetch，跟随重定向时自动切换 |
+| HTTP/1.0 协议 | 避免 chunked 编码，简化响应处理，降低 CPU 消耗 |
+| `IdentityTransformStream` + `pipeTo` | 运行时原生优化的流式传输，支持 170MB+ 大仓库完整克隆 |
+| `Content-Encoding: identity` | 阻止 Cloudflare 边缘代理自动压缩，避免大文件缓冲溢出 |
+| `DecompressionStream('gzip')` | 解压 git 客户端 gzip 压缩的 POST 请求体（HTTP/1.0 不支持 Content-Encoding） |
 
 ### 支持功能
 
 - ✅ GitHub Release 下载
 - ✅ Archive 下载（分支/标签源码包）
-- ✅ Git clone（通过 HTTP 智能协议）
+- ✅ Git clone（通过 HTTP 智能协议，支持 170MB+ 大仓库完整克隆）
 - ✅ Git push（通过 `http.extraHeader` 认证）
 - ✅ API 访问（api.github.com）
 - ✅ Raw 文件（raw.githubusercontent.com）
@@ -31,6 +35,17 @@ GitHub release、archive、raw 文件、API 加速项目，**完整支持 git cl
 - ✅ Codeload（codeload.github.com）
 - ✅ 大文件流式传输（githubusercontent.com 走 fetch）
 - ✅ POST 请求体转发（git-upload-pack / git-receive-pack）
+
+### 性能测试
+
+| 测试项 | 仓库大小 | 耗时 | 结果 |
+|--------|----------|------|------|
+| 浅克隆 (--depth 1) | 740K | ~3s | ✅ |
+| 完整克隆 (media-on-terminal) | 174M | 79s | ✅ |
+| 完整克隆 (workers-sdk) | 191M | 27s | ✅ |
+| Archive 下载 | 112K | <1s | ✅ |
+| Raw 文件下载 | 52K | <1s | ✅ |
+| API 访问 | - | <1s | ✅ |
 
 ## 使用方法
 
@@ -142,9 +157,33 @@ const whiteList = []
 用户请求 → Cloudflare Worker (workers.js)
                 ├── github.com / api.github.com / codeload.github.com
                 │   └── connect() TLS socket（绕过 SSL 525）
+                │       └── HTTP/1.0 + IdentityTransformStream + pipeTo
                 └── *.githubusercontent.com
                     └── fetch()（流式传输，支持大文件）
 ```
+
+### 关键技术细节
+
+**HTTP/1.0 协议选择**：
+- HTTP/1.0 不支持 chunked Transfer-Encoding，简化了响应处理
+- 服务端通过 Connection: close 标识响应结束
+- 避免 de-chunking 操作消耗 CPU 时间（免费计划限制 10ms）
+
+**IdentityTransformStream + pipeTo 流式传输**：
+- 使用 Cloudflare 运行时原生的 `IdentityTransformStream`（无操作 TransformStream）
+- `pipeTo` 由运行时内部处理，无 JavaScript 回调开销
+- 自动处理背压和流量控制
+- 支持 170MB+ 大仓库完整克隆，CPU 时间 < 1ms
+
+**请求体 gzip 解压**：
+- git 客户端可能对 POST 请求体做 gzip 压缩（Content-Encoding: gzip）
+- HTTP/1.0 不支持 Content-Encoding，Worker 端使用 `DecompressionStream('gzip')` 解压
+- 解压后移除 Content-Encoding 头，更新 Content-Length
+
+**阻止 Cloudflare 自动压缩**：
+- 响应头设置 `Content-Encoding: identity`，阻止边缘代理自动 gzip 压缩
+- 自动压缩会缓冲整个响应体，对大文件（>128MB）导致内存溢出和流截断
+- 设置 `Cache-Control: no-cache, no-transform` 阻止任何中间转换
 
 ### 域名分类
 
