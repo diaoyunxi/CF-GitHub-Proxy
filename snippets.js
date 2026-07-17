@@ -25,6 +25,11 @@ const exp4 = /^(?:https?:\/\/)?raw\.(?:githubusercontent|github)\.com\/.+?\/.+?\
 const exp5 = /^(?:https?:\/\/)?gist\.(?:githubusercontent|github)\.com\/.+?\/.+?\/.+$/i
 const exp6 = /^(?:https?:\/\/)?github\.com\/.+?\/.+?\/tags.*$/i
 const exp7 = /^(?:https?:\/\/)?api\.github\.com\/.*$/i
+// 新增: GitHub release 文件下载重定向目标域名
+const exp8 = /^(?:https?:\/\/)?objects\.githubusercontent\.com\/.*$/i
+const exp9 = /^(?:https?:\/\/)?codeload\.github\.com\/.*$/i
+// 新增: GitHub general 下载域名
+const exp10 = /^(?:https?:\/\/)?(?:.+?\.)?github\.com\/.+?\/releases\/download\/.+$/i
 
 function makeRes(body, status = 200, headers = {}) {
     headers['access-control-allow-origin'] = '*'
@@ -40,7 +45,7 @@ function newUrl(urlStr) {
 }
 
 function checkUrl(u) {
-    for (let i of [exp1, exp2, exp3, exp4, exp5, exp6, exp7]) {
+    for (let i of [exp1, exp2, exp3, exp4, exp5, exp6, exp7, exp8, exp9, exp10]) {
         if (u.search(i) === 0) return true
     }
     return false
@@ -135,7 +140,8 @@ function httpHandler(req, pathname) {
     const reqInit = {
         method: req.method,
         headers: reqHdrNew,
-        redirect: 'manual',
+        // 使用 follow 模式让 Cloudflare fetch 直接处理重定向，避免 SSL 525 错误
+        redirect: 'follow',
         body: req.body
     }
 
@@ -143,31 +149,41 @@ function httpHandler(req, pathname) {
 }
 
 async function proxy(urlObj, reqInit) {
-    const res = await fetch(urlObj.href, reqInit)
-
-    const resHdrNew = new Headers(res.headers)
-    const status = res.status
-
-    if (resHdrNew.has('location')) {
-        let loc = resHdrNew.get('location')
-
-        if (checkUrl(loc)) {
-            resHdrNew.set('location', PREFIX + loc)
-        } else {
-            reqInit.redirect = 'follow'
-            return proxy(newUrl(loc), reqInit)
-        }
+    // 清理可能导致 SSL 握手问题的 Cloudflare 内部头
+    if (reqInit.headers instanceof Headers) {
+        reqInit.headers.delete('cf-connecting-ip')
+        reqInit.headers.delete('cf-ray')
+        reqInit.headers.delete('cf-visitor')
+        reqInit.headers.delete('cf-ipcountry')
     }
 
-    resHdrNew.set('access-control-expose-headers', '*')
-    resHdrNew.set('access-control-allow-origin', '*')
+    try {
+        const res = await fetch(urlObj.href, reqInit)
 
-    resHdrNew.delete('content-security-policy')
-    resHdrNew.delete('content-security-policy-report-only')
-    resHdrNew.delete('clear-site-data')
+        const resHdrNew = new Headers(res.headers)
+        const status = res.status
 
-    return new Response(res.body, {
-        status,
-        headers: resHdrNew,
-    })
+        // 处理重定向（当 redirect: 'follow' 未生效时的兜底）
+        if (resHdrNew.has('location')) {
+            let loc = resHdrNew.get('location')
+            if (checkUrl(loc)) {
+                resHdrNew.set('location', PREFIX + loc)
+            }
+        }
+
+        resHdrNew.set('access-control-expose-headers', '*')
+        resHdrNew.set('access-control-allow-origin', '*')
+
+        resHdrNew.delete('content-security-policy')
+        resHdrNew.delete('content-security-policy-report-only')
+        resHdrNew.delete('clear-site-data')
+
+        return new Response(res.body, {
+            status,
+            headers: resHdrNew,
+        })
+    } catch (err) {
+        // 捕获 SSL 和网络错误，返回有意义的错误信息
+        return makeRes('proxy error: ' + err.message + '\nURL: ' + urlObj.href, 502)
+    }
 }
