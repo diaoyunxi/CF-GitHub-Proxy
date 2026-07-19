@@ -18,10 +18,12 @@ GitHub release、archive、raw 文件、API 加速项目，**完整支持 git cl
 | `cloudflare:sockets` `connect()` | 绕过 Worker `fetch()` 对 github.com 的 SSL 525 错误 |
 | `fetch()` | 处理不受 525 影响的域名（`*.githubusercontent.com`），支持流式传输大文件 |
 | 混合传输 | 自动根据目标域名选择 socket 或 fetch，跟随重定向时自动切换 |
-| HTTP/1.0 协议 | 避免 chunked 编码，简化响应处理，降低 CPU 消耗 |
+| HTTP/1.0 协议 | git 协议传输，避免 chunked 编码，简化响应处理 |
+| HTTP/1.1 socket（API 专用） | GitHub API 调用，绕过 `fetch()` 的 SSL 525 和 WAF 拦截 |
 | `IdentityTransformStream` + `pipeTo` | 运行时原生优化的流式传输，支持 170MB+ 大仓库完整克隆 |
 | `Content-Encoding: identity` | 阻止 Cloudflare 边缘代理自动压缩，避免大文件缓冲溢出 |
 | `DecompressionStream('gzip')` | 解压 git 客户端 gzip 压缩的 POST 请求体（HTTP/1.0 不支持 Content-Encoding） |
+| 流式 ZIP 生成 | 文件夹下载：边下载文件边生成 ZIP，支持任意大小文件夹 |
 
 ### 支持功能
 
@@ -35,6 +37,8 @@ GitHub release、archive、raw 文件、API 加速项目，**完整支持 git cl
 - ✅ Codeload（codeload.github.com）
 - ✅ 大文件流式传输（githubusercontent.com 走 fetch）
 - ✅ POST 请求体转发（git-upload-pack / git-receive-pack）
+- ✅ **文件夹下载**（tree 路径自动打包为 ZIP，支持子目录、中文文件名）
+- ✅ **单文件下载**（blob 路径直接走 raw.githubusercontent.com，不依赖 jsDelivr）
 
 ### 性能测试
 
@@ -46,6 +50,9 @@ GitHub release、archive、raw 文件、API 加速项目，**完整支持 git cl
 | Archive 下载 | 112K | <1s | ✅ |
 | Raw 文件下载 | 52K | <1s | ✅ |
 | API 访问 | - | <1s | ✅ |
+| 文件夹下载 (src/) | 786K | ~3s | ✅ |
+| 根目录下载 (全仓库 ZIP) | 804K | ~3s | ✅ |
+| 单文件下载 (README.md) | 5.6K | <1s | ✅ |
 
 ## 使用方法
 
@@ -81,6 +88,40 @@ git -c http.extraHeader="Authorization: Basic $AUTH" push origin main
 git clone https://user:TOKEN@your-domain.com/https://github.com/user/repo.git
 ```
 
+### 文件夹下载
+
+访问 GitHub 仓库的 `tree` 路径，自动将文件夹打包为 ZIP 下载：
+
+```
+# 下载 src 文件夹
+https://your-domain.com/https://github.com/user/repo/tree/main/src
+
+# 下载根目录（整个仓库打包为 ZIP）
+https://your-domain.com/https://github.com/user/repo/tree/main
+
+# 下载嵌套子目录
+https://your-domain.com/https://github.com/user/repo/tree/main/src/components
+```
+
+**技术细节**：
+- 调用 GitHub Git Trees API 获取文件列表
+- 通过 `raw.githubusercontent.com` 流式下载每个文件
+- 边下载边生成 ZIP（使用 Data Descriptor 模式，无需 seek）
+- 支持 UTF-8 文件名（含中文）
+- 无大小限制（流式传输）
+
+> **速率限制**：未认证 60 次/小时/IP，设置 `GITHUB_TOKEN` 后提升到 5000 次/小时。
+
+### 单文件下载
+
+访问 GitHub 仓库的 `blob` 路径，直接通过 `raw.githubusercontent.com` 下载文件：
+
+```
+https://your-domain.com/https://github.com/user/repo/blob/main/README.md
+```
+
+> 单文件下载不依赖 jsDelivr，直接走 `raw.githubusercontent.com`，支持私有仓库（需 Token）。
+
 ### 合法输入示例
 
 以下都是合法输入（仅示例，文件不存在）：
@@ -89,6 +130,8 @@ git clone https://user:TOKEN@your-domain.com/https://github.com/user/repo.git
 - release源码：`https://github.com/hunshcn/project/archive/v0.1.0.tar.gz`
 - release文件：`https://github.com/hunshcn/project/releases/download/v0.1.0/example.zip`
 - 分支文件：`https://github.com/hunshcn/project/blob/master/filename`
+- 文件夹下载：`https://github.com/hunshcn/project/tree/master/src`
+- 根目录下载：`https://github.com/hunshcn/project/tree/master`
 - commit文件：`https://github.com/hunshcn/project/blob/1111111111111111111111111111/filename`
 - gist：`https://gist.githubusercontent.com/cielpy/351557e6e465c12986419ac5a4dd2568/raw/cmd.py`
 - api：`https://api.github.com/repos/Geekertao/CF-Workers-GitHub-Proxy`
@@ -145,8 +188,10 @@ wrangler deploy workers.js --name gh --compatibility-date 2026-07-17
 const ASSET_URL = 'https://geekertao.github.io/gh-proxy/'
 // 路由前缀
 const PREFIX = '/'
-// jsDelivr 镜像开关（1=开启 blob 文件走 jsDelivr，0=关闭）
-const Config = { jsdelivr: 0 }
+// GitHub Token（可选，用于文件夹下载的 API 认证，提升速率限制到 5000次/小时）
+// 留空则使用未认证方式（60次/小时/IP）
+// 也可通过 URL 参数 ?token=xxx 或 Authorization 请求头传入
+const GITHUB_TOKEN = ''
 // 白名单（路径中包含指定字符才通过，空数组=不限制）
 const whiteList = []
 ```
@@ -155,19 +200,33 @@ const whiteList = []
 
 ```
 用户请求 → Cloudflare Worker (workers.js)
-                ├── github.com / api.github.com / codeload.github.com
+                ├── github.com / codeload.github.com / gist.github.com
                 │   └── connect() TLS socket（绕过 SSL 525）
                 │       └── HTTP/1.0 + IdentityTransformStream + pipeTo
-                └── *.githubusercontent.com
-                    └── fetch()（流式传输，支持大文件）
+                ├── api.github.com（文件夹下载 API 调用）
+                │   └── connect() TLS socket（绕过 SSL 525 + WAF）
+                │       └── HTTP/1.1 + chunked/gzip 解码 + 重定向跟随
+                ├── *.githubusercontent.com（文件下载、raw 文件）
+                │   └── fetch()（流式传输，支持大文件）
+                └── tree 路径（文件夹下载）
+                    └── Git Trees API → 流式 ZIP 生成
+                        ├── HTTP/1.1 socket 获取文件列表
+                        └── fetch() 逐文件下载 + CRC-32 + ZIP 流式写入
 ```
 
 ### 关键技术细节
 
-**HTTP/1.0 协议选择**：
+**HTTP/1.0 协议选择（git 协议）**：
 - HTTP/1.0 不支持 chunked Transfer-Encoding，简化了响应处理
 - 服务端通过 Connection: close 标识响应结束
 - 避免 de-chunking 操作消耗 CPU 时间（免费计划限制 10ms）
+
+**HTTP/1.1 socket（GitHub API 专用）**：
+- `fetch()` 对 api.github.com 返回 SSL 525 错误
+- HTTP/1.0 对 GitHub API 不兼容（返回 403/500 Unicorn）
+- 使用 HTTP/1.1 + 浏览器 UA 绕过 WAF 拦截
+- 支持 chunked 响应解码和 gzip 解压
+- 自动跟随 301 重定向（`repos/{owner}/{repo}` → `repositories/{id}`）
 
 **IdentityTransformStream + pipeTo 流式传输**：
 - 使用 Cloudflare 运行时原生的 `IdentityTransformStream`（无操作 TransformStream）
@@ -184,6 +243,13 @@ const whiteList = []
 - 响应头设置 `Content-Encoding: identity`，阻止边缘代理自动 gzip 压缩
 - 自动压缩会缓冲整个响应体，对大文件（>128MB）导致内存溢出和流截断
 - 设置 `Cache-Control: no-cache, no-transform` 阻止任何中间转换
+
+**流式 ZIP 生成（文件夹下载）**：
+- 使用 ZIP Data Descriptor 模式（bit 3 标志），CRC 和 size 在文件数据之后写入
+- 无需 seek 回写，完美适配流式传输
+- 逐文件通过 `raw.githubusercontent.com` 下载，边下载边计算 CRC-32
+- 支持 UTF-8 文件名（bit 11 标志，含中文）
+- ZIP 结构：Local File Header → File Data → Data Descriptor → ... → Central Directory → EOCD
 
 ### 域名分类
 

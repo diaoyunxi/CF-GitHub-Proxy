@@ -29,10 +29,14 @@ import { connect } from 'cloudflare:sockets'
 const ASSET_URL = 'https://geekertao.github.io/gh-proxy/'
 /** 前缀，如自定义路由为 example.com/gh/*，改为 '/gh/' */
 const PREFIX = '/'
-/** jsDelivr 镜像开关，1=开启（blob 文件走 jsDelivr），0=关闭 */
-const Config = { jsdelivr: 0 }
 /** 白名单，路径中包含指定字符才通过，如 ['/username/'] */
 const whiteList = []
+/**
+ * GitHub Token（可选，用于文件夹下载的 API 认证，提升速率限制到 5000次/小时）
+ * 留空则使用未认证方式（60次/小时/IP）
+ * 也可通过 URL 参数 ?token=xxx 或 Authorization 请求头传入
+ */
+const GITHUB_TOKEN = ''
 
 // =====================================================================
 // 域名分类
@@ -71,6 +75,8 @@ const exp6 = /^(?:https?:\/\/)?github\.com\/.+?\/.+?\/tags.*$/i
 const exp7 = /^(?:https?:\/\/)?api\.github\.com\/.*$/i
 const exp8 = /^(?:https?:\/\/)?objects\.githubusercontent\.com\/.*$/i
 const exp9 = /^(?:https?:\/\/)?codeload\.github\.com\/.*$/i
+/** 匹配 github.com tree 路径（文件夹下载） */
+const exp10 = /^(?:https?:\/\/)?github\.com\/([^/]+)\/([^/]+)\/tree\/([^/]+)\/?(.*)$/i
 
 // =====================================================================
 // 工具函数
@@ -192,14 +198,12 @@ async function fetchHandler(req) {
         // github.com releases/archive/info/git-refs/raw/gist/tags/codeload → 混合传输
         return httpHandler(req, path)
     } else if (path.search(exp2) === 0) {
-        // github.com blob/raw → 转换为 raw 路径走混合传输
-        if (Config.jsdelivr) {
-            const newUrl = path.replace('/blob/', '@').replace(/^(?:https?:\/\/)?github\.com/, 'https://cdn.jsdelivr.net/gh')
-            return Response.redirect(newUrl, 302)
-        } else {
-            path = path.replace('/blob/', '/raw/')
-            return httpHandler(req, path)
-        }
+        // github.com blob/raw → 转换为 raw 路径走混合传输（不依赖 jsDelivr）
+        path = path.replace('/blob/', '/raw/')
+        return httpHandler(req, path)
+    } else if (path.search(exp10) === 0) {
+        // github.com tree 路径 → 文件夹下载（打包为 ZIP）
+        return downloadFolderHandler(req, path)
     } else {
         // 静态资源
         return fetch(ASSET_URL + path)
@@ -897,6 +901,608 @@ async function diagnosticsHandler() {
             'content-type': 'application/json',
             'access-control-allow-origin': '*',
         },
+    })
+}
+
+// =====================================================================
+// GitHub API 请求（HTTP/1.1 socket，绕过 fetch() 的 SSL 525）
+// =====================================================================
+
+/**
+ * 通过 HTTP/1.1 socket 调用 GitHub API 并返回解析后的 JSON
+ *
+ * 为什么需要专用函数：
+ * - fetch() 对 api.github.com 返回 SSL 525 错误
+ * - rawHttpRequest 使用 HTTP/1.0，GitHub API 不兼容（返回 403/500）
+ * - 本函数使用 HTTP/1.1，完整读取响应，支持 chunked 和 gzip 解码
+ *
+ * 适用于小响应体（API JSON 响应通常 < 1MB）：
+ * - 完整读入内存后解析
+ * - 支持 Transfer-Encoding: chunked 解码
+ * - 支持 Content-Encoding: gzip 解压（虽然请求 identity，但服务器可能忽略）
+ *
+ * @param {string} apiUrl - 完整 API URL
+ * @param {Object} headers - 请求头键值对
+ * @returns {Object} { status, json, responseHeaders, method }
+ */
+async function fetchApiJson(apiUrl, headers) {
+    let currentUrl = apiUrl
+    const maxRedirects = 5
+
+    for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount++) {
+        // 优先尝试 fetch()（某些情况可能不返回 525）
+        let result = null
+        try {
+            const fetchHeaders = new Headers()
+            for (const [k, v] of Object.entries(headers)) {
+                fetchHeaders.set(k, v)
+            }
+            const resp = await fetch(currentUrl, { headers: fetchHeaders, redirect: 'manual' })
+            if (resp.status !== 525) {
+                let bodyText = ''
+                let json = null
+                try {
+                    bodyText = await resp.text()
+                    json = JSON.parse(bodyText)
+                } catch (e) { /* 非 JSON 响应 */ }
+
+                // 处理重定向
+                if (resp.status >= 300 && resp.status < 400) {
+                    const location = resp.headers.get('location')
+                    if (location && redirectCount < maxRedirects) {
+                        currentUrl = new URL(location, currentUrl).href
+                        continue
+                    }
+                }
+
+                return {
+                    status: resp.status,
+                    json,
+                    bodyText,
+                    responseHeaders: resp.headers,
+                    method: 'fetch',
+                }
+            }
+            // 525 → 回退到 socket
+        } catch (e) {
+            // fetch 异常 → 回退到 socket
+        }
+
+        // 回退到 HTTP/1.1 socket
+        const targetUrl = new URL(currentUrl)
+        const hostname = targetUrl.hostname
+        const port = targetUrl.port || 443
+        const path = targetUrl.pathname + targetUrl.search
+
+        const socket = connect(`${hostname}:${port}`, {
+            secureTransport: 'on',
+            allowHalfOpen: false,
+        })
+
+        // 构造 HTTP/1.1 请求
+        const writer = socket.writable.getWriter()
+        let reqStr = `GET ${path} HTTP/1.1\r\n`
+        // 更新 Host 头为当前域名
+        const finalHeaders = { ...headers }
+        finalHeaders['Host'] = hostname
+        if (!finalHeaders['Connection'] && !finalHeaders['connection']) finalHeaders['Connection'] = 'close'
+        if (!finalHeaders['Accept-Encoding'] && !finalHeaders['accept-encoding']) finalHeaders['Accept-Encoding'] = 'identity'
+        for (const [key, val] of Object.entries(finalHeaders)) {
+            reqStr += `${key}: ${val}\r\n`
+        }
+        reqStr += '\r\n'
+
+        await writer.write(new TextEncoder().encode(reqStr))
+        writer.releaseLock()
+
+        // 读取完整响应（API 响应通常较小，可安全读入内存）
+        const reader = socket.readable.getReader()
+        const chunks = []
+        let totalLength = 0
+
+        while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            chunks.push(value)
+            totalLength += value.length
+        }
+
+        // 合并所有块
+        const fullResponse = new Uint8Array(totalLength)
+        let offset = 0
+        for (const chunk of chunks) {
+            fullResponse.set(chunk, offset)
+            offset += chunk.length
+        }
+
+        // 解析响应头
+        const headerEnd = findHeaderEnd(fullResponse)
+        if (headerEnd === -1) {
+            throw new Error('Invalid HTTP response: header end not found')
+        }
+
+        const headerText = new TextDecoder().decode(fullResponse.slice(0, headerEnd))
+        const lines = headerText.split('\r\n')
+        const statusMatch = lines[0].match(/^HTTP\/\d\.\d\s+(\d+)/)
+        const status = statusMatch ? parseInt(statusMatch[1]) : 0
+
+        const responseHeaders = {}
+        for (let i = 1; i < lines.length; i++) {
+            const idx = lines[i].indexOf(':')
+            if (idx > 0) {
+                const key = lines[i].substring(0, idx).trim().toLowerCase()
+                const val = lines[i].substring(idx + 1).trim()
+                responseHeaders[key] = val
+            }
+        }
+
+        // 处理重定向
+        if (status >= 300 && status < 400) {
+            const location = responseHeaders['location']
+            if (location && redirectCount < maxRedirects) {
+                currentUrl = new URL(location, currentUrl).href
+                continue
+            }
+        }
+
+        let bodyBytes = fullResponse.slice(headerEnd + 4)
+
+        // 处理 chunked 编码
+        if (responseHeaders['transfer-encoding'] === 'chunked') {
+            bodyBytes = dechunkResponse(bodyBytes)
+        }
+
+        // 处理 gzip 压缩（虽然请求了 identity，但服务器可能忽略）
+        if (responseHeaders['content-encoding'] === 'gzip') {
+            const ds = new DecompressionStream('gzip')
+            const stream = new Blob([bodyBytes]).stream().pipeThrough(ds)
+            bodyBytes = new Uint8Array(await new Response(stream).arrayBuffer())
+        }
+
+        // 解析 JSON 和响应体文本
+        const bodyText = new TextDecoder().decode(bodyBytes)
+        let json = null
+        if (status >= 200 && status < 300) {
+            try {
+                json = JSON.parse(bodyText)
+            } catch (e) {
+                // JSON 解析失败，返回 null
+            }
+        }
+
+        // 构造类似 Headers 的对象
+        const headersObj = {
+            get: (name) => responseHeaders[name.toLowerCase()] || null,
+            raw: responseHeaders,
+        }
+
+        return {
+            status,
+            json,
+            bodyText,
+            responseHeaders: headersObj,
+            method: 'socket-http1.1',
+        }
+    }
+
+    throw new Error(`Too many redirects (> ${maxRedirects})`)
+}
+
+/**
+ * 解码 HTTP/1.1 chunked Transfer-Encoding
+ * @param {Uint8Array} data - chunked 编码的数据
+ * @returns {Uint8Array} 解码后的数据
+ */
+function dechunkResponse(data) {
+    const result = []
+    let pos = 0
+    while (pos < data.length) {
+        // 查找 chunk size 行的 CRLF
+        const crlfPos = findCRLF(data, pos)
+        if (crlfPos === -1) break
+        const sizeStr = new TextDecoder().decode(data.slice(pos, crlfPos))
+        const chunkSize = parseInt(sizeStr.split(';')[0], 16)
+        if (isNaN(chunkSize) || chunkSize === 0) break
+        pos = crlfPos + 2 // 跳过 CRLF
+        if (pos + chunkSize > data.length) break
+        // 提取 chunk 数据
+        result.push(data.slice(pos, pos + chunkSize))
+        pos += chunkSize + 2 // 跳过数据和 CRLF
+    }
+    // 合并所有 chunk
+    let totalLen = 0
+    for (const chunk of result) {
+        totalLen += chunk.length
+    }
+    const merged = new Uint8Array(totalLen)
+    let off = 0
+    for (const chunk of result) {
+        merged.set(chunk, off)
+        off += chunk.length
+    }
+    return merged
+}
+
+// =====================================================================
+// 文件夹下载：GitHub tree 路径 → 流式 ZIP
+// =====================================================================
+
+/**
+ * CRC-32 查找表（多项式 0xEDB88320，IEEE 802.3 标准）
+ * 用于 ZIP 文件格式的 CRC-32 校验
+ */
+const CRC32_TABLE = new Uint32Array(256)
+;(() => {
+    for (let n = 0; n < 256; n++) {
+        let c = n
+        for (let k = 0; k < 8; k++) {
+            c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1)
+        }
+        CRC32_TABLE[n] = c
+    }
+})()
+
+/**
+ * 生成 ZIP Local File Header
+ * 使用 Data Descriptor（bit 3 标志）和 UTF-8 文件名（bit 11 标志）
+ * CRC 和 size 在 Data Descriptor 中提供，header 中填 0
+ *
+ * @param {string} filename - ZIP 内的文件路径（UTF-8）
+ * @returns {Uint8Array} Local File Header 字节
+ */
+function makeLocalFileHeader(filename) {
+    const nameBytes = new TextEncoder().encode(filename)
+    const header = new Uint8Array(30 + nameBytes.length)
+    const dv = new DataView(header.buffer)
+
+    dv.setUint32(0, 0x04034b50, true)        // 签名 PK\x03\x04
+    dv.setUint16(4, 20, true)                 // 解压所需版本 2.0
+    dv.setUint16(6, 0x0808, true)             // 标志：bit3=DataDescriptor, bit11=UTF-8
+    dv.setUint16(8, 0, true)                  // 压缩方法：0=Store
+    dv.setUint16(10, 0, true)                 // 最后修改时间
+    dv.setUint16(12, 0x0021, true)            // 最后修改日期（1980-01-01）
+    dv.setUint32(14, 0, true)                 // CRC-32（在 Data Descriptor 中）
+    dv.setUint32(18, 0, true)                 // 压缩后大小（在 DD 中）
+    dv.setUint32(22, 0, true)                 // 原始大小（在 DD 中）
+    dv.setUint16(26, nameBytes.length, true)  // 文件名长度
+    dv.setUint16(28, 0, true)                 // extra 字段长度
+    header.set(nameBytes, 30)
+
+    return header
+}
+
+/**
+ * 生成 ZIP Data Descriptor
+ * 在文件数据之后写入，包含 CRC-32 和实际大小
+ *
+ * @param {number} crc - CRC-32 值
+ * @param {number} size - 文件大小（Store 方法：压缩后大小 = 原始大小）
+ * @returns {Uint8Array} Data Descriptor 字节
+ */
+function makeDataDescriptor(crc, size) {
+    const dd = new Uint8Array(16)
+    const dv = new DataView(dd.buffer)
+
+    dv.setUint32(0, 0x08074b50, true)  // 签名（可选但推荐）
+    dv.setUint32(4, crc, true)          // CRC-32
+    dv.setUint32(8, size, true)         // 压缩后大小
+    dv.setUint32(12, size, true)        // 原始大小
+
+    return dd
+}
+
+/**
+ * 生成 ZIP Central Directory Header
+ *
+ * @param {string} filename - ZIP 内的文件路径
+ * @param {number} crc - CRC-32 值
+ * @param {number} size - 文件大小
+ * @param {number} localHeaderOffset - 对应 Local File Header 的偏移
+ * @returns {Uint8Array} Central Directory Header 字节
+ */
+function makeCentralDirHeader(filename, crc, size, localHeaderOffset) {
+    const nameBytes = new TextEncoder().encode(filename)
+    const header = new Uint8Array(46 + nameBytes.length)
+    const dv = new DataView(header.buffer)
+
+    dv.setUint32(0, 0x02014b50, true)        // 签名 PK\x01\x02
+    dv.setUint16(4, 20, true)                 // 制作版本
+    dv.setUint16(6, 20, true)                 // 解压所需版本
+    dv.setUint16(8, 0x0808, true)             // 标志：bit3+bit11
+    dv.setUint16(10, 0, true)                 // 压缩方法：Store
+    dv.setUint16(12, 0, true)                 // 最后修改时间
+    dv.setUint16(14, 0x0021, true)            // 最后修改日期
+    dv.setUint32(16, crc, true)               // CRC-32
+    dv.setUint32(20, size, true)              // 压缩后大小
+    dv.setUint32(24, size, true)              // 原始大小
+    dv.setUint16(28, nameBytes.length, true)  // 文件名长度
+    dv.setUint16(30, 0, true)                 // extra 字段长度
+    dv.setUint16(32, 0, true)                 // 文件注释长度
+    dv.setUint16(34, 0, true)                 // 起始磁盘号
+    dv.setUint16(36, 0, true)                 // 内部文件属性
+    dv.setUint32(38, 0, true)                 // 外部文件属性
+    dv.setUint32(42, localHeaderOffset, true) // 本地文件头相对偏移
+    header.set(nameBytes, 46)
+
+    return header
+}
+
+/**
+ * 生成 ZIP End of Central Directory Record
+ *
+ * @param {number} entryCount - 文件条目数
+ * @param {number} cdSize - Central Directory 总大小
+ * @param {number} cdOffset - Central Directory 起始偏移
+ * @returns {Uint8Array} EOCD 字节
+ */
+function makeEOCD(entryCount, cdSize, cdOffset) {
+    const eocd = new Uint8Array(22)
+    const dv = new DataView(eocd.buffer)
+
+    dv.setUint32(0, 0x06054b50, true)    // 签名 PK\x05\x06
+    dv.setUint16(4, 0, true)              // 当前磁盘号
+    dv.setUint16(6, 0, true)              // 中央目录起始磁盘号
+    dv.setUint16(8, entryCount, true)     // 本磁盘 CD 记录数
+    dv.setUint16(10, entryCount, true)    // CD 记录总数
+    dv.setUint32(12, cdSize, true)        // CD 大小
+    dv.setUint32(16, cdOffset, true)      // CD 起始偏移
+    dv.setUint16(20, 0, true)             // 注释长度
+
+    return eocd
+}
+
+/**
+ * 文件夹下载处理器
+ *
+ * 解析 github.com tree URL，调用 Git Trees API 获取文件列表，
+ * 流式生成 ZIP 返回给客户端。
+ *
+ * URL 格式：/https://github.com/{owner}/{repo}/tree/{branch}/{folder}
+ *
+ * 流程：
+ * 1. 解析 URL 提取 owner/repo/branch/folder
+ * 2. 调用 Git Trees API（recursive=1）获取整个仓库文件树
+ * 3. 过滤出指定文件夹下的所有文件
+ * 4. 流式生成 ZIP：
+ *    - 对每个文件，通过 raw.githubusercontent.com 下载
+ *    - 边下载边计算 CRC-32，直接写入 ZIP 输出流
+ *    - 使用 Data Descriptor 模式，无需 seek 回写
+ * 5. 写入 Central Directory 和 EOCD 完成 ZIP
+ *
+ * @param {Request} req - 原始请求
+ * @param {string} path - 匹配的路径
+ * @returns {Response} ZIP 文件流式响应
+ */
+async function downloadFolderHandler(req, path) {
+    // 解析 URL
+    const match = path.match(exp10)
+    if (!match) {
+        return makeRes('Invalid folder URL', 400)
+    }
+    const [, owner, repo, branch, folderPath] = match
+    const cleanFolder = folderPath.replace(/\/+$/, '').replace(/^\/+/, '')
+
+    // 获取 GitHub Token（优先级：URL 参数 > Authorization 头 > 全局配置）
+    const urlObj = new URL(req.url)
+    const tokenParam = urlObj.searchParams.get('token')
+    const authHeader = req.headers.get('authorization')
+    let githubToken = tokenParam || GITHUB_TOKEN
+    let authHeaderValue = authHeader
+    if (!authHeaderValue && githubToken) {
+        authHeaderValue = `token ${githubToken}`
+    }
+
+    // 构造 Git Trees API URL
+    const treeApiUrl = `https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`
+
+    // 构造 API 请求头（使用浏览器 UA 避免 GitHub WAF 拦截）
+    const apiHeaders = {
+        'Host': 'api.github.com',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/vnd.github+json',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'close',
+        'Accept-Encoding': 'identity',
+    }
+    if (authHeaderValue) {
+        apiHeaders['Authorization'] = authHeaderValue
+    }
+
+    // 调用 Git Trees API（使用 HTTP/1.1 socket，绕过 fetch() 的 SSL 525）
+    let apiResult
+    try {
+        apiResult = await fetchApiJson(treeApiUrl, apiHeaders)
+    } catch (err) {
+        return makeRes(`Failed to fetch tree: ${err.message}`, 502)
+    }
+
+    if (apiResult.status !== 200) {
+        const bodyText = apiResult.bodyText || (apiResult.json ? JSON.stringify(apiResult.json) : '(no response body)')
+        if (apiResult.status === 403) {
+            const remaining = apiResult.responseHeaders.get('x-ratelimit-remaining')
+            const limit = apiResult.responseHeaders.get('x-ratelimit-limit')
+            // 输出所有响应头用于诊断
+            const rawHeaders = apiResult.responseHeaders.raw || {}
+            const headerDump = Object.entries(rawHeaders).map(([k, v]) => `${k}: ${v}`).join('\n')
+            return makeRes(
+                `GitHub API rate limit (403). Method: ${apiResult.method}\n` +
+                `Rate: ${remaining || '?'}/${limit || '?'} (remaining/limit)\n` +
+                `Auth: ${authHeaderValue ? 'yes' : 'no'}\n` +
+                `To increase to 5000/hour, set GITHUB_TOKEN, pass ?token=xxx, ` +
+                `or send Authorization header.\n\n` +
+                `Response headers:\n${headerDump}\n\n` +
+                `Response body: ${bodyText.substring(0, 500)}`,
+                429
+            )
+        }
+        // 诊断其他错误状态（包含完整响应头）
+        const rawHeaders = apiResult.responseHeaders.raw || {}
+        const headerDump = Object.entries(rawHeaders).map(([k, v]) => `${k}: ${v}`).join('\n')
+        return makeRes(
+            `GitHub API error (${apiResult.method}): ${apiResult.status}\n` +
+            `Response headers:\n${headerDump}\n\n` +
+            `Response body: ${bodyText.substring(0, 500)}`,
+            apiResult.status
+        )
+    }
+
+    const treeData = apiResult.json
+    if (!treeData) {
+        return makeRes('Failed to parse tree response', 502)
+    }
+
+    // 检查是否截断
+    if (treeData.truncated) {
+        return makeRes('Repository too large: tree API returned truncated results. Please use git clone instead.', 501)
+    }
+
+    // 过滤出指定文件夹下的文件（type=blob）
+    const prefix = cleanFolder ? cleanFolder + '/' : ''
+    const files = (treeData.tree || []).filter(item =>
+        item.type === 'blob' &&
+        (cleanFolder === '' || item.path.startsWith(prefix))
+    )
+
+    if (files.length === 0) {
+        return makeRes(`Folder '${cleanFolder || '/'}' is empty or does not exist in ${owner}/${repo}:${branch}`, 404)
+    }
+
+    // 文件夹名（用于 ZIP 文件名）
+    const folderName = cleanFolder ? cleanFolder.split('/').pop() : repo
+    const zipFileName = `${folderName}.zip`
+
+    // 流式生成 ZIP
+    const { readable, writable } = new IdentityTransformStream()
+    const writer = writable.getWriter()
+
+    // 异步生成 ZIP（不 await，让 Response 立即返回开始流式传输）
+    ;(async () => {
+        const centralDir = []
+        let offset = 0
+        let fileIndex = 0
+
+        try {
+            for (const file of files) {
+                // ZIP 内文件路径：去掉文件夹前缀，保留相对路径
+                const relativePath = cleanFolder
+                    ? file.path.substring(prefix.length)
+                    : file.path
+
+                // 写 Local File Header
+                const localHeader = makeLocalFileHeader(relativePath)
+                await writer.write(localHeader)
+                const localHeaderSize = localHeader.length
+
+                // 下载文件内容并计算 CRC-32
+                const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${file.path}`
+                const fetchHeaders = new Headers({ 'User-Agent': 'git/2.39.0' })
+                if (authHeaderValue) {
+                    fetchHeaders.set('Authorization', authHeaderValue)
+                }
+
+                let crc = 0xFFFFFFFF
+                let dataSize = 0
+
+                try {
+                    const fileResponse = await fetch(rawUrl, { headers: fetchHeaders })
+                    if (fileResponse.ok && fileResponse.body) {
+                        const reader = fileResponse.body.getReader()
+                        while (true) {
+                            const { done, value } = await reader.read()
+                            if (done) break
+                            if (value && value.length > 0) {
+                                // 分块更新 CRC-32
+                                for (let i = 0; i < value.length; i++) {
+                                    crc = CRC32_TABLE[(crc ^ value[i]) & 0xFF] ^ (crc >>> 8)
+                                }
+                                dataSize += value.length
+                                await writer.write(value)
+                            }
+                        }
+                    } else if (fileResponse.ok) {
+                        // 无 body 流，用 arrayBuffer 读取
+                        const buf = await fileResponse.arrayBuffer()
+                        const arr = new Uint8Array(buf)
+                        for (let i = 0; i < arr.length; i++) {
+                            crc = CRC32_TABLE[(crc ^ arr[i]) & 0xFF] ^ (crc >>> 8)
+                        }
+                        dataSize = arr.length
+                        await writer.write(arr)
+                    } else {
+                        // 文件下载失败，写入空内容（ZIP 仍可解压其他文件）
+                        console.log(JSON.stringify({
+                            step: 'folder_download_file_failed',
+                            file: file.path,
+                            status: fileResponse.status,
+                        }))
+                    }
+                } catch (fileErr) {
+                    console.log(JSON.stringify({
+                        step: 'folder_download_file_error',
+                        file: file.path,
+                        error: String(fileErr),
+                    }))
+                }
+
+                crc = (crc ^ 0xFFFFFFFF) >>> 0
+
+                // 写 Data Descriptor
+                const dd = makeDataDescriptor(crc, dataSize)
+                await writer.write(dd)
+
+                // 记录 Central Directory 信息
+                centralDir.push({
+                    name: relativePath,
+                    crc,
+                    size: dataSize,
+                    offset
+                })
+
+                offset += localHeaderSize + dataSize + dd.length
+                fileIndex++
+            }
+
+            // 写 Central Directory
+            const cdOffset = offset
+            let cdSize = 0
+            for (const entry of centralDir) {
+                const cdHeader = makeCentralDirHeader(entry.name, entry.crc, entry.size, entry.offset)
+                await writer.write(cdHeader)
+                cdSize += cdHeader.length
+            }
+
+            // 写 EOCD
+            const eocd = makeEOCD(centralDir.length, cdSize, cdOffset)
+            await writer.write(eocd)
+
+            await writer.close()
+
+            console.log(JSON.stringify({
+                step: 'folder_download_complete',
+                owner, repo, branch, folder: cleanFolder,
+                fileCount: centralDir.length,
+                totalSize: offset + cdSize + eocd.length,
+            }))
+        } catch (err) {
+            console.log(JSON.stringify({
+                step: 'folder_download_error',
+                error: String(err),
+                filesProcessed: fileIndex,
+            }))
+            try { await writer.abort(err) } catch (e) {}
+        }
+    })()
+
+    return new Response(readable, {
+        status: 200,
+        headers: {
+            'Content-Type': 'application/zip',
+            'Content-Disposition': `attachment; filename="${zipFileName}"`,
+            'access-control-allow-origin': '*',
+            'access-control-expose-headers': '*',
+            'Content-Encoding': 'identity',
+            'Cache-Control': 'no-cache, no-transform',
+        }
     })
 }
 
