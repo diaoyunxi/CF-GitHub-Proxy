@@ -37,6 +37,12 @@ const whiteList = []
  * 也可通过 URL 参数 ?token=xxx 或 Authorization 请求头传入
  */
 const GITHUB_TOKEN = ''
+/**
+ * 是否启用 Releases 列表功能
+ * 开启后访问 /https://github.com/user/repo/releases 返回可点击的 Release 列表页
+ * 关闭后该路径走原有混合传输逻辑（返回 GitHub 原始页面）
+ */
+const ENABLE_RELEASES_LIST = true
 
 // =====================================================================
 // 域名分类
@@ -77,6 +83,8 @@ const exp8 = /^(?:https?:\/\/)?objects\.githubusercontent\.com\/.*$/i
 const exp9 = /^(?:https?:\/\/)?codeload\.github\.com\/.*$/i
 /** 匹配 github.com tree 路径（文件夹下载） */
 const exp10 = /^(?:https?:\/\/)?github\.com\/([^/]+)\/([^/]+)\/tree\/([^/]+)\/?(.*)$/i
+/** 匹配 github.com/user/repo/releases 列表页（不含 /download/ 路径） */
+const exp11 = /^(?:https?:\/\/)?github\.com\/([^/]+)\/([^/]+)\/releases\/?$/i
 
 // =====================================================================
 // 工具函数
@@ -192,6 +200,9 @@ async function fetchHandler(req) {
     if (path.search(exp7) === 0) {
         // api.github.com → 混合传输
         return httpHandler(req, path)
+    } else if (ENABLE_RELEASES_LIST && path.search(exp11) === 0) {
+        // github.com/user/repo/releases 列表页 → 返回可点击的 Release 列表
+        return releasesListHandler(req, path)
     } else if (path.search(exp1) === 0 || path.search(exp5) === 0 ||
                path.search(exp6) === 0 || path.search(exp3) === 0 ||
                path.search(exp4) === 0 || path.search(exp9) === 0) {
@@ -902,6 +913,455 @@ async function diagnosticsHandler() {
             'access-control-allow-origin': '*',
         },
     })
+}
+
+// =====================================================================
+// Releases 列表页
+// =====================================================================
+
+/**
+ * HTML 转义，防止 XSS
+ * @param {string} str
+ * @returns {string}
+ */
+function escapeHtml(str) {
+    if (!str) return ''
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+}
+
+/**
+ * 格式化文件大小
+ * @param {number} bytes
+ * @returns {string}
+ */
+function formatFileSize(bytes) {
+    if (!bytes || bytes <= 0) return '0 B'
+    const units = ['B', 'KB', 'MB', 'GB']
+    const i = Math.floor(Math.log(bytes) / Math.log(1024))
+    return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i]
+}
+
+/**
+ * 格式化日期时间
+ * @param {string} isoStr - ISO 8601 日期字符串
+ * @returns {string}
+ */
+function formatDate(isoStr) {
+    if (!isoStr) return ''
+    try {
+        const d = new Date(isoStr)
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+    } catch (e) {
+        return isoStr
+    }
+}
+
+/**
+ * 将 Markdown 截断为纯文本摘要
+ * @param {string} md - Markdown 文本
+ * @param {number} maxLen - 最大长度
+ * @returns {string}
+ */
+function markdownToSummary(md, maxLen = 200) {
+    if (!md) return ''
+    let text = md
+        .replace(/```[\s\S]*?```/g, '[代码块]')
+        .replace(/#{1,6}\s/g, '')
+        .replace(/\*\*([^*]+)\*\*/g, '$1')
+        .replace(/\*([^*]+)\*/g, '$1')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+        .replace(/^\s*[-*+]\s/gm, '')
+        .replace(/\n{2,}/g, '\n')
+        .trim()
+    if (text.length > maxLen) {
+        text = text.substring(0, maxLen) + '...'
+    }
+    return text
+}
+
+/**
+ * Releases 列表页处理函数
+ *
+ * 访问 /https://github.com/user/repo/releases 时：
+ * 1. 调用 GitHub API 获取该仓库的 Releases 列表
+ * 2. 生成 HTML 页面，展示每个 Release 的版本号、时间、摘要、下载链接
+ * 3. 下载链接指向代理地址，用户点击后通过本站加速下载
+ *
+ * @param {Request} req
+ * @param {string} path - 匹配 exp11 的路径
+ * @returns {Response}
+ */
+async function releasesListHandler(req, path) {
+    const match = path.match(exp11)
+    if (!match) {
+        return makeRes('Invalid releases URL', 400)
+    }
+    const [, owner, repoRaw] = match
+    const repo = repoRaw.replace(/\.git$/, '')
+
+    // 获取 GitHub Token（与 downloadFolderHandler 一致的优先级）
+    const urlObj = new URL(req.url)
+    const tokenParam = urlObj.searchParams.get('token')
+    const authHeader = req.headers.get('authorization')
+    let githubToken = tokenParam || GITHUB_TOKEN
+    let authHeaderValue = authHeader
+    if (!authHeaderValue && githubToken) {
+        authHeaderValue = `token ${githubToken}`
+    }
+
+    // 构造 API 请求头（浏览器 UA 避免 WAF 拦截）
+    const apiHeaders = {
+        'Host': 'api.github.com',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/vnd.github+json',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'close',
+        'Accept-Encoding': 'identity',
+    }
+    if (authHeaderValue) {
+        apiHeaders['Authorization'] = authHeaderValue
+    }
+
+    // 调用 GitHub Releases API
+    const apiUrl = `https://api.github.com/repos/${owner}/${repo}/releases?per_page=30`
+    let apiResult
+    try {
+        apiResult = await fetchApiJson(apiUrl, apiHeaders)
+    } catch (err) {
+        return makeRes(`Failed to fetch releases: ${err.message}`, 502)
+    }
+
+    if (apiResult.status !== 200) {
+        const bodyText = apiResult.bodyText || ''
+        if (apiResult.status === 404) {
+            return makeRes(`仓库 ${owner}/${repo} 不存在或没有 Releases`, 404)
+        }
+        if (apiResult.status === 403) {
+            const remaining = apiResult.responseHeaders.get('x-ratelimit-remaining')
+            return makeRes(
+                `GitHub API 速率限制 (403)。剩余: ${remaining || '?'}\n` +
+                `可通过 ?token=xxx 传入 Token 提升至 5000次/小时`,
+                429
+            )
+        }
+        return makeRes(`GitHub API error: ${apiResult.status}\n${bodyText.substring(0, 300)}`, apiResult.status)
+    }
+
+    const releases = apiResult.json || []
+    const proxyOrigin = urlObj.origin
+
+    // 生成 HTML 页面
+    const html = generateReleasesHtml(owner, repo, releases, proxyOrigin)
+
+    return new Response(html, {
+        status: 200,
+        headers: {
+            'content-type': 'text/html; charset=utf-8',
+            'access-control-allow-origin': '*',
+            'Cache-Control': 'no-cache, no-transform',
+        }
+    })
+}
+
+/**
+ * 生成 Releases 列表 HTML 页面
+ * @param {string} owner - 仓库所有者
+ * @param {string} repo - 仓库名
+ * @param {Array} releases - GitHub API 返回的 releases 数组
+ * @param {string} proxyOrigin - 代理站点 origin（用于拼接下载链接）
+ * @returns {string}
+ */
+function generateReleasesHtml(owner, repo, releases, proxyOrigin) {
+    const repoUrl = `${proxyOrigin}/https://github.com/${owner}/${repo}`
+
+    // 构建 Release 卡片
+    const cards = releases.map((rel, idx) => {
+        const tagName = escapeHtml(rel.tag_name || 'unknown')
+        const releaseName = escapeHtml(rel.name || rel.tag_name || '')
+        const publishedAt = formatDate(rel.published_at)
+        const createdAt = formatDate(rel.created_at)
+        const isPrerelease = rel.prerelease
+        const isDraft = rel.draft
+        const htmlUrl = escapeHtml(rel.html_url || '')
+        const summary = escapeHtml(markdownToSummary(rel.body || '', 300))
+
+        // 状态标签
+        let badge = ''
+        if (isDraft) {
+            badge = '<span class="badge badge-draft">Draft</span>'
+        } else if (isPrerelease) {
+            badge = '<span class="badge badge-pre">Pre-release</span>'
+        } else {
+            badge = '<span class="badge badge-stable">Latest</span>'
+        }
+
+        // Assets 下载链接
+        const assets = (rel.assets || []).map(asset => {
+            const assetName = escapeHtml(asset.name)
+            const assetSize = formatFileSize(asset.size)
+            const downloadCount = asset.download_count || 0
+            // 下载链接：代理地址 + 原始 GitHub URL
+            const downloadUrl = `${proxyOrigin}/${asset.browser_download_url}`
+            const ext = assetName.split('.').pop().toLowerCase()
+            let icon = '📄'
+            if (['zip', 'tar', 'gz', '7z', 'rar'].includes(ext)) icon = '📦'
+            else if (['exe', 'msi', 'appimage', 'deb', 'rpm'].includes(ext)) icon = '⚙️'
+            else if (['dmg', 'pkg'].includes(ext)) icon = '🍎'
+            else if (['apk'].includes(ext)) icon = '📱'
+            return `<a href="${downloadUrl}" class="asset-link" title="下载 ${assetName}">
+                <span class="asset-icon">${icon}</span>
+                <span class="asset-name">${assetName}</span>
+                <span class="asset-size">${assetSize}</span>
+                <span class="asset-downloads">↓${downloadCount}</span>
+            </a>`
+        }).join('')
+
+        // Source code 下载链接
+        const sourceZipUrl = `${proxyOrigin}/https://github.com/${owner}/${repo}/archive/${rel.tag_name}.zip`
+        const sourceTarUrl = `${proxyOrigin}/https://github.com/${owner}/${repo}/archive/${rel.tag_name}.tar.gz`
+        const sourceLinks = `
+            <a href="${sourceZipUrl}" class="asset-link source-link">
+                <span class="asset-icon">📦</span>
+                <span class="asset-name">Source code (zip)</span>
+            </a>
+            <a href="${sourceTarUrl}" class="asset-link source-link">
+                <span class="asset-icon">📦</span>
+                <span class="asset-name">Source code (tar.gz)</span>
+            </a>`
+
+        return `
+        <div class="release-card${idx === 0 && !isDraft ? ' release-latest' : ''}">
+            <div class="release-header">
+                <div class="release-title">
+                    <span class="release-tag">${tagName}</span>
+                    ${badge}
+                </div>
+                <div class="release-meta">
+                    <span class="release-date" title="发布于 ${publishedAt}">📅 ${publishedAt}</span>
+                </div>
+            </div>
+            ${releaseName && releaseName !== tagName ? `<div class="release-name">${releaseName}</div>` : ''}
+            ${summary ? `<div class="release-summary">${summary}</div>` : ''}
+            <div class="release-assets">
+                ${assets || ''}
+                ${sourceLinks}
+            </div>
+        </div>`
+    }).join('\n')
+
+    const emptyState = releases.length === 0
+        ? `<div class="empty-state">
+            <p>📭 该仓库暂无 Releases</p>
+            <a href="${repoUrl}" class="back-link">返回仓库主页</a>
+           </div>`
+        : ''
+
+    return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${escapeHtml(owner)}/${escapeHtml(repo)} - Releases</title>
+<style>
+:root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface-hover: #1c2128;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --brand: #2f81f7;
+    --brand-soft: rgba(47, 129, 247, 0.1);
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --radius: 8px;
+    --radius-card: 12px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 20px;
+}
+.container {
+    max-width: 800px;
+    margin: 0 auto;
+}
+.header {
+    text-align: center;
+    padding: 2rem 1rem 1.5rem;
+}
+.header h1 {
+    font-size: 1.8rem;
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+}
+.header h1 a {
+    color: var(--brand);
+    text-decoration: none;
+}
+.header h1 a:hover {
+    text-decoration: underline;
+}
+.header .subtitle {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+.release-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    padding: 1.5rem;
+    margin-bottom: 1rem;
+    transition: border-color 0.2s;
+}
+.release-card:hover {
+    border-color: var(--text-muted);
+}
+.release-latest {
+    border-color: var(--green);
+}
+.release-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 0.8rem;
+}
+.release-title {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+}
+.release-tag {
+    font-size: 1.2rem;
+    font-weight: 600;
+    font-family: monospace;
+}
+.badge {
+    font-size: 0.75rem;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-weight: 500;
+}
+.badge-stable { background: rgba(63, 185, 80, 0.15); color: var(--green); border: 1px solid rgba(63, 185, 80, 0.3); }
+.badge-pre { background: rgba(210, 153, 34, 0.15); color: var(--yellow); border: 1px solid rgba(210, 153, 34, 0.3); }
+.badge-draft { background: rgba(139, 148, 158, 0.15); color: var(--text-muted); border: 1px solid var(--border); }
+.release-meta { color: var(--text-muted); font-size: 0.85rem; }
+.release-name {
+    font-size: 1rem;
+    font-weight: 500;
+    margin-bottom: 0.6rem;
+    color: var(--text);
+}
+.release-summary {
+    font-size: 0.875rem;
+    color: var(--text-muted);
+    line-height: 1.6;
+    margin-bottom: 1rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 200px;
+    overflow: hidden;
+    position: relative;
+}
+.release-summary::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 40px;
+    background: linear-gradient(transparent, var(--surface));
+}
+.release-assets {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding-top: 0.8rem;
+    border-top: 1px solid var(--border);
+}
+.asset-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.4rem 0.8rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    text-decoration: none;
+    font-size: 0.85rem;
+    transition: all 0.2s;
+}
+.asset-link:hover {
+    background: var(--surface-hover);
+    border-color: var(--brand);
+    color: var(--brand);
+}
+.source-link {
+    font-style: italic;
+    color: var(--text-muted);
+}
+.asset-icon { font-size: 1rem; }
+.asset-name { font-family: monospace; }
+.asset-size { color: var(--text-muted); font-size: 0.8rem; }
+.asset-downloads { color: var(--text-muted); font-size: 0.75rem; }
+.empty-state {
+    text-align: center;
+    padding: 4rem 1rem;
+    color: var(--text-muted);
+}
+.empty-state p { font-size: 1.2rem; margin-bottom: 1rem; }
+.back-link {
+    display: inline-block;
+    padding: 0.5rem 1.5rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--brand);
+    text-decoration: none;
+    font-size: 0.9rem;
+}
+.back-link:hover { background: var(--surface-hover); }
+.footer {
+    text-align: center;
+    padding: 2rem 1rem;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+}
+.footer a { color: var(--brand); text-decoration: none; }
+.footer a:hover { text-decoration: underline; }
+@media (max-width: 600px) {
+    .release-header { flex-direction: column; align-items: flex-start; }
+    .header h1 { font-size: 1.4rem; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1><a href="${repoUrl}">${escapeHtml(owner)}/${escapeHtml(repo)}</a></h1>
+        <p class="subtitle">Releases 列表 · 共 ${releases.length} 个版本</p>
+    </div>
+    ${cards}
+    ${emptyState}
+    <div class="footer">
+        <p>由 <a href="${proxyOrigin}/">GitHub 镜像站</a> 提供加速 · 基于 <a href="https://github.com/Geekertao/CF-Workers-GitHub-Proxy" target="_blank">CF-Workers-GitHub-Proxy</a></p>
+    </div>
+</div>
+</body>
+</html>`
 }
 
 // =====================================================================

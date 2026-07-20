@@ -214,6 +214,12 @@ body {
         </button>
     </div>
 
+    <div style="margin-top: 0.8rem;">
+        <button onclick="goReleases()" style="padding: 0.5rem 1.5rem; background: rgba(47,129,247,0.15); border: 1px solid rgba(47,129,247,0.4); border-radius: 8px; color: #58a6ff; cursor: pointer; font-size: 0.9rem; transition: all 0.2s;" onmouseover="this.style.background='rgba(47,129,247,0.25)'" onmouseout="this.style.background='rgba(47,129,247,0.15)'">
+            📋 查看 Releases 列表
+        </button>
+    </div>
+
     <div class="feature-grid">
         <div class="feature-item">Git Clone / Push</div>
         <div class="feature-item">Release 下载</div>
@@ -233,6 +239,8 @@ body {
         <p>git clone 本站地址/https://github.com/user/repo.git</p>
         <p style="margin-top: 1.2rem; color: #9ba1a6; font-family: sans-serif;">文件夹下载（自动打包为 ZIP）:</p>
         <p>本站地址/https://github.com/user/repo/tree/main/folder</p>
+        <p style="margin-top: 1.2rem; color: #9ba1a6; font-family: sans-serif;">Releases 列表:</p>
+        <p>本站地址/https://github.com/user/repo/releases</p>
     </div>
 
     <div class="example">
@@ -241,6 +249,7 @@ body {
         <p>https://github.com/user/repo/archive/master.zip</p>
         <p>https://github.com/user/repo/blob/main/filename</p>
         <p>https://github.com/user/repo/tree/main/src</p>
+        <p>https://github.com/user/repo/releases</p>
         <p>https://github.com/user/repo</p>
         <p>https://api.github.com/repos/user/repo</p>
         <p>https://gist.githubusercontent.com/user/hash/raw/file.py</p>
@@ -259,6 +268,21 @@ function go() {
     // 去掉开头的协议头后拼接
     v = v.replace(/^https?:\/\//, '');
     // 如果不以 / 开头，加上 /
+    if (!v.startsWith('/')) v = '/' + v;
+    location.href = v;
+}
+
+function goReleases() {
+    let v = document.getElementById('urlInput').value.trim();
+    if (!v) return;
+    // 去掉协议头
+    v = v.replace(/^https?:\/\//, '');
+    // 去掉末尾斜杠和 .git
+    v = v.replace(/\/+$/, '').replace(/\.git$/, '');
+    // 如果是 github.com/user/repo 格式，追加 /releases
+    if (/^github\.com\/[^/]+\/[^/]+$/.test(v)) {
+        v = v + '/releases';
+    }
     if (!v.startsWith('/')) v = '/' + v;
     location.href = v;
 }
