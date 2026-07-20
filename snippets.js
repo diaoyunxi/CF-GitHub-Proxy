@@ -25,8 +25,8 @@ import { connect } from 'cloudflare:sockets'
 // 配置
 // =====================================================================
 
-/** 静态资源地址（404 页面、sw.js、conf.js） */
-const ASSET_URL = 'https://geekertao.github.io/gh-proxy/'
+/** 静态资源地址（首页、404 页面等） */
+const ASSET_URL = 'https://diaoyunxi.github.io/CF-GitHub-Proxy/'
 /** 前缀，如自定义路由为 example.com/gh/*，改为 '/gh/' */
 const PREFIX = '/'
 /** 白名单，路径中包含指定字符才通过，如 ['/username/'] */
