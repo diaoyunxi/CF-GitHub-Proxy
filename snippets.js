@@ -942,8 +942,13 @@ function escapeHtml(str) {
 function formatFileSize(bytes) {
     if (!bytes || bytes <= 0) return '0 B'
     const units = ['B', 'KB', 'MB', 'GB']
-    const i = Math.floor(Math.log(bytes) / Math.log(1024))
-    return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i]
+    let i = 0
+    let size = bytes
+    while (size >= 1024 && i < units.length - 1) {
+        size /= 1024
+        i++
+    }
+    return (i > 0 ? size.toFixed(1) : Math.floor(size)) + ' ' + units[i]
 }
 
 /**
@@ -1038,7 +1043,6 @@ async function releasesListHandler(req, path) {
     }
 
     if (apiResult.status !== 200) {
-        const bodyText = apiResult.bodyText || ''
         if (apiResult.status === 404) {
             return makeRes(`仓库 ${owner}/${repo} 不存在或没有 Releases`, 404)
         }
@@ -1050,7 +1054,7 @@ async function releasesListHandler(req, path) {
                 429
             )
         }
-        return makeRes(`GitHub API error: ${apiResult.status}\n${bodyText.substring(0, 300)}`, apiResult.status)
+        return makeRes(`GitHub API error: ${apiResult.status}`, apiResult.status)
     }
 
     const releases = apiResult.json || []
@@ -1085,10 +1089,8 @@ function generateReleasesHtml(owner, repo, releases, proxyOrigin) {
         const tagName = escapeHtml(rel.tag_name || 'unknown')
         const releaseName = escapeHtml(rel.name || rel.tag_name || '')
         const publishedAt = formatDate(rel.published_at)
-        const createdAt = formatDate(rel.created_at)
         const isPrerelease = rel.prerelease
         const isDraft = rel.draft
-        const htmlUrl = escapeHtml(rel.html_url || '')
         const summary = escapeHtml(markdownToSummary(rel.body || '', 300))
 
         // 状态标签
@@ -1101,20 +1103,25 @@ function generateReleasesHtml(owner, repo, releases, proxyOrigin) {
             badge = '<span class="badge badge-stable">Latest</span>'
         }
 
-        // Assets 下载链接
+        // Assets 下载链接（对 URL 进行安全验证和转义）
         const assets = (rel.assets || []).map(asset => {
             const assetName = escapeHtml(asset.name)
             const assetSize = formatFileSize(asset.size)
             const downloadCount = asset.download_count || 0
-            // 下载链接：代理地址 + 原始 GitHub URL
-            const downloadUrl = `${proxyOrigin}/${asset.browser_download_url}`
-            const ext = assetName.split('.').pop().toLowerCase()
+            // 安全拼接下载链接：验证 URL 为 GitHub 域名后拼接
+            const rawDownloadUrl = asset.browser_download_url || ''
+            const downloadUrl = rawDownloadUrl.startsWith('https://github.com/')
+                ? `${proxyOrigin}/${rawDownloadUrl}`
+                : escapeHtml(rawDownloadUrl)
+            // 文件图标（对扩展名安全处理）
+            const lastDot = asset.name.lastIndexOf('.')
+            const ext = lastDot >= 0 ? asset.name.substring(lastDot + 1).toLowerCase() : ''
             let icon = '📄'
             if (['zip', 'tar', 'gz', '7z', 'rar'].includes(ext)) icon = '📦'
             else if (['exe', 'msi', 'appimage', 'deb', 'rpm'].includes(ext)) icon = '⚙️'
             else if (['dmg', 'pkg'].includes(ext)) icon = '🍎'
             else if (['apk'].includes(ext)) icon = '📱'
-            return `<a href="${downloadUrl}" class="asset-link" title="下载 ${assetName}">
+            return `<a href="${escapeHtml(downloadUrl)}" class="asset-link" title="下载 ${assetName}">
                 <span class="asset-icon">${icon}</span>
                 <span class="asset-name">${assetName}</span>
                 <span class="asset-size">${assetSize}</span>
@@ -1122,15 +1129,16 @@ function generateReleasesHtml(owner, repo, releases, proxyOrigin) {
             </a>`
         }).join('')
 
-        // Source code 下载链接
-        const sourceZipUrl = `${proxyOrigin}/https://github.com/${owner}/${repo}/archive/${rel.tag_name}.zip`
-        const sourceTarUrl = `${proxyOrigin}/https://github.com/${owner}/${repo}/archive/${rel.tag_name}.tar.gz`
+        // Source code 下载链接（tag_name 已转义为 tagName，但 URL 需原始值）
+        const rawTag = rel.tag_name || ''
+        const sourceZipUrl = `${proxyOrigin}/https://github.com/${owner}/${repo}/archive/${encodeURIComponent(rawTag)}.zip`
+        const sourceTarUrl = `${proxyOrigin}/https://github.com/${owner}/${repo}/archive/${encodeURIComponent(rawTag)}.tar.gz`
         const sourceLinks = `
-            <a href="${sourceZipUrl}" class="asset-link source-link">
+            <a href="${escapeHtml(sourceZipUrl)}" class="asset-link source-link">
                 <span class="asset-icon">📦</span>
                 <span class="asset-name">Source code (zip)</span>
             </a>
-            <a href="${sourceTarUrl}" class="asset-link source-link">
+            <a href="${escapeHtml(sourceTarUrl)}" class="asset-link source-link">
                 <span class="asset-icon">📦</span>
                 <span class="asset-name">Source code (tar.gz)</span>
             </a>`
@@ -1143,7 +1151,7 @@ function generateReleasesHtml(owner, repo, releases, proxyOrigin) {
                     ${badge}
                 </div>
                 <div class="release-meta">
-                    <span class="release-date" title="发布于 ${publishedAt}">📅 ${publishedAt}</span>
+                    <span class="release-date" title="发布于 ${escapeHtml(publishedAt)}">📅 ${escapeHtml(publishedAt)}</span>
                 </div>
             </div>
             ${releaseName && releaseName !== tagName ? `<div class="release-name">${releaseName}</div>` : ''}
@@ -1777,33 +1785,19 @@ async function downloadFolderHandler(req, path) {
     }
 
     if (apiResult.status !== 200) {
-        const bodyText = apiResult.bodyText || (apiResult.json ? JSON.stringify(apiResult.json) : '(no response body)')
         if (apiResult.status === 403) {
             const remaining = apiResult.responseHeaders.get('x-ratelimit-remaining')
             const limit = apiResult.responseHeaders.get('x-ratelimit-limit')
-            // 输出所有响应头用于诊断
-            const rawHeaders = apiResult.responseHeaders.raw || {}
-            const headerDump = Object.entries(rawHeaders).map(([k, v]) => `${k}: ${v}`).join('\n')
             return makeRes(
                 `GitHub API rate limit (403). Method: ${apiResult.method}\n` +
                 `Rate: ${remaining || '?'}/${limit || '?'} (remaining/limit)\n` +
                 `Auth: ${authHeaderValue ? 'yes' : 'no'}\n` +
                 `To increase to 5000/hour, set GITHUB_TOKEN, pass ?token=xxx, ` +
-                `or send Authorization header.\n\n` +
-                `Response headers:\n${headerDump}\n\n` +
-                `Response body: ${bodyText.substring(0, 500)}`,
+                `or send Authorization header.`,
                 429
             )
         }
-        // 诊断其他错误状态（包含完整响应头）
-        const rawHeaders = apiResult.responseHeaders.raw || {}
-        const headerDump = Object.entries(rawHeaders).map(([k, v]) => `${k}: ${v}`).join('\n')
-        return makeRes(
-            `GitHub API error (${apiResult.method}): ${apiResult.status}\n` +
-            `Response headers:\n${headerDump}\n\n` +
-            `Response body: ${bodyText.substring(0, 500)}`,
-            apiResult.status
-        )
+        return makeRes(`GitHub API error (${apiResult.method}): ${apiResult.status}`, apiResult.status)
     }
 
     const treeData = apiResult.json
