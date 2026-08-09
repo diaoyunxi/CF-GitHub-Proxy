@@ -85,6 +85,8 @@ const exp9 = /^(?:https?:\/\/)?codeload\.github\.com\/.*$/i
 const exp10 = /^(?:https?:\/\/)?github\.com\/([^/]+)\/([^/]+)\/tree\/([^/]+)\/?(.*)$/i
 /** 匹配 github.com/user/repo/releases 列表页（不含 /download/ 路径） */
 const exp11 = /^(?:https?:\/\/)?github\.com\/([^/]+)\/([^/]+)\/releases\/?$/i
+/** 匹配 github.com/login/oauth/ 路径（OAuth 授权页与 token 交换接口） */
+const exp12 = /^(?:https?:\/\/)?github\.com\/login\/oauth\/.+$/i
 
 // =====================================================================
 // 工具函数
@@ -128,7 +130,7 @@ function newUrl(urlStr) {
  * @param {string} u
  */
 function checkUrl(u) {
-    for (let i of [exp1, exp2, exp3, exp4, exp5, exp6, exp7, exp8, exp9]) {
+    for (let i of [exp1, exp2, exp3, exp4, exp5, exp6, exp7, exp8, exp9, exp12]) {
         if (u.search(i) === 0) {
             return true
         }
@@ -199,6 +201,9 @@ async function fetchHandler(req) {
     // 路由匹配
     if (path.search(exp7) === 0) {
         // api.github.com → 混合传输
+        return httpHandler(req, path)
+    } else if (path.search(exp12) === 0) {
+        // github.com/login/oauth/* → 混合传输（OAuth 授权/ token 交换）
         return httpHandler(req, path)
     } else if (ENABLE_RELEASES_LIST && path.search(exp11) === 0) {
         // github.com/user/repo/releases 列表页 → 返回可点击的 Release 列表
