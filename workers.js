@@ -1,4 +1,12 @@
 /**
+ * ⚠️ 安全注意事项 (Security Notes):
+ * 1. CORS 使用通配符 '*' 是代理服务的有意设计，生产部署时建议限制为可信域名
+ * 2. Token 可通过 URL 参数 (?token=xxx) 传递，存在浏览器历史/日志/Referer 泄露风险
+ *    建议生产环境仅使用 Authorization 请求头传递 token
+ * 3. whiteList 为空时不做路径过滤，部署时建议配置白名单限制访问范围
+ */
+
+/**
  * CF-Workers-GitHub-Proxy
  * 基于 Cloudflare Workers 的 GitHub 全功能镜像站
  *
@@ -24,6 +32,14 @@ import { connect } from 'cloudflare:sockets'
 // =====================================================================
 // 配置
 // =====================================================================
+
+/**
+ * ⚠️ 安全注意事项 (Security Notes):
+ * 1. CORS 使用通配符 '*' 是代理服务的有意设计，生产部署时建议限制为可信域名
+ * 2. Token 可通过 URL 参数 (?token=xxx) 传递，存在浏览器历史/日志/Referer 泄露风险
+ *    建议生产环境仅使用 Authorization 请求头传递 token
+ * 3. whiteList 为空时不做路径过滤，部署时建议配置白名单限制访问范围
+ */
 
 /** 静态资源地址（首页、404 页面等） */
 const ASSET_URL = 'https://diaoyunxi.github.io/CF-GitHub-Proxy/'
@@ -1017,6 +1033,7 @@ async function releasesListHandler(req, path) {
 
     // 获取 GitHub Token（与 downloadFolderHandler 一致的优先级）
     const urlObj = new URL(req.url)
+    // ⚠️ URL 传 token 会泄露到日志/历史/Referer，建议仅用 Authorization 头
     const tokenParam = urlObj.searchParams.get('token')
     const authHeader = req.headers.get('authorization')
     let githubToken = tokenParam || GITHUB_TOKEN
@@ -1757,6 +1774,7 @@ async function downloadFolderHandler(req, path) {
 
     // 获取 GitHub Token（优先级：URL 参数 > Authorization 头 > 全局配置）
     const urlObj = new URL(req.url)
+    // ⚠️ URL 传 token 会泄露到日志/历史/Referer，建议仅用 Authorization 头
     const tokenParam = urlObj.searchParams.get('token')
     const authHeader = req.headers.get('authorization')
     let githubToken = tokenParam || GITHUB_TOKEN
