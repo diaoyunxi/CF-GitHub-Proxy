@@ -161,7 +161,18 @@ function canUseFetch(hostname) {
 export default {
     async fetch(request, env, ctx) {
         try {
-            return await fetchHandler(request)
+            const response = await fetchHandler(request)
+            // 全局安全响应头：防止 MIME 嗅探、点击劫持、信息泄露
+            const headers = new Headers(response.headers)
+            headers.set('X-Content-Type-Options', 'nosniff')
+            headers.set('X-Frame-Options', 'DENY')
+            headers.set('Referrer-Policy', 'strict-origin-when-cross-origin')
+            headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+            return new Response(response.body, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: headers,
+            })
         } catch (err) {
             return makeRes('cfworker error:\n' + err.stack, 502)
         }
