@@ -110,6 +110,13 @@ const PREFLIGHT_INIT = {
  */
 function makeRes(body, status = 200, headers = {}) {
     headers['access-control-allow-origin'] = '*'
+    // 安全响应头：防止 MIME 嗅探和点击劫持
+    headers['x-content-type-options'] = 'nosniff'
+    headers['x-frame-options'] = 'DENY'
+    // 速率限制响应添加 Retry-After 头，提示客户端等待
+    if (status === 429 && !headers['retry-after']) {
+        headers['retry-after'] = '60'
+    }
     return new Response(body, {status, headers})
 }
 
