@@ -1018,8 +1018,14 @@ async function releasesListHandler(req, path) {
     // 获取 GitHub Token（与 downloadFolderHandler 一致的优先级）
     const urlObj = new URL(req.url)
     const tokenParam = urlObj.searchParams.get('token')
+    // CWE-598: 从 URL 移除 token 参数，防止出现在 Cloudflare 访问日志中
+    if (tokenParam) urlObj.searchParams.delete('token')
     const authHeader = req.headers.get('authorization')
     let githubToken = tokenParam || GITHUB_TOKEN
+    // 清理 URL 中的 token 参数，防止浏览器历史记录泄露
+    if (tokenParam && typeof history !== 'undefined') {
+      try { history.replaceState(null, '', urlObj.toString()) } catch(_){}
+    }
     let authHeaderValue = authHeader
     if (!authHeaderValue && githubToken) {
         authHeaderValue = `token ${githubToken}`
@@ -1758,8 +1764,14 @@ async function downloadFolderHandler(req, path) {
     // 获取 GitHub Token（优先级：URL 参数 > Authorization 头 > 全局配置）
     const urlObj = new URL(req.url)
     const tokenParam = urlObj.searchParams.get('token')
+    // CWE-598: 从 URL 移除 token 参数，防止出现在 Cloudflare 访问日志中
+    if (tokenParam) urlObj.searchParams.delete('token')
     const authHeader = req.headers.get('authorization')
     let githubToken = tokenParam || GITHUB_TOKEN
+    // 清理 URL 中的 token 参数，防止浏览器历史记录泄露
+    if (tokenParam && typeof history !== 'undefined') {
+      try { history.replaceState(null, '', urlObj.toString()) } catch(_){}
+    }
     let authHeaderValue = authHeader
     if (!authHeaderValue && githubToken) {
         authHeaderValue = `token ${githubToken}`
