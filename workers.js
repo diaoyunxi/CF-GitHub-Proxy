@@ -182,6 +182,13 @@ async function fetchHandler(req) {
     // q 参数重定向
     let path = urlObj.searchParams.get('q')
     if (path) {
+        // 安全校验：防止开放重定向 (CWE-601)
+        if (path.startsWith('//') || path.includes('@') || /^https?:/.test(path)) {
+            return makeRes('Invalid redirect path', 400)
+        }
+        if (!path.startsWith('/')) {
+            path = '/' + path
+        }
         return Response.redirect('https://' + urlObj.host + PREFIX + path, 301)
     }
 
