@@ -1,0 +1,9 @@
+{
+  "name": "cf-github-proxy",
+  "version": "1.0.0",
+  "description": "GitHub release / archive / raw proxy via Cloudflare Workers",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy"
+  }
+}

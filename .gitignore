@@ -1,0 +1,10 @@
+# Wrangler 缓存和临时文件
+.wrangler/
+
+# Node.js
+node_modules/
+package-lock.json
+
+# 临时文件
+*.log
+*.tmp
