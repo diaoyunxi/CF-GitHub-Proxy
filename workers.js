@@ -185,13 +185,17 @@ async function fetchHandler(req) {
         return Response.redirect('https://' + urlObj.host + PREFIX + path, 301)
     }
 
-    // 诊断端点
-    if (urlObj.pathname === '/__diag__') {
-        return diagnosticsHandler()
-    }
-
-    // Socket 测试端点
-    if (urlObj.pathname === '/__socket_test__') {
+    // 诊断端点（需要 DIAG_TOKEN 认证，防止信息泄露 CWE-306）
+    // 部署时通过 Wrangler 环境变量设置 DIAG_TOKEN，请求时传入 ?diag_token=xxx
+    if (urlObj.pathname === '/__diag__' || urlObj.pathname === '/__socket_test__') {
+        const diagToken = typeof env !== 'undefined' ? env.DIAG_TOKEN : ''
+        const reqToken = urlObj.searchParams.get('diag_token') || ''
+        if (!diagToken || reqToken !== diagToken) {
+            return makeRes('403 Forbidden', 403)
+        }
+        if (urlObj.pathname === '/__diag__') {
+            return diagnosticsHandler()
+        }
         return socketTest()
     }
 
