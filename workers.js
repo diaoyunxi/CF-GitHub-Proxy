@@ -2000,3 +2000,10 @@ async function socketTest() {
         },
     })
 }
+
+// =====================================================================
+// Rate Limiting Note
+// =====================================================================
+// GitHub API unauthenticated rate limit: 60 requests/hour/IP
+// With GITHUB_TOKEN: 5000 requests/hour
+// Consider implementing client-side caching for frequently accessed resources
