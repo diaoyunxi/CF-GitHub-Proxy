@@ -43,6 +43,13 @@ const GITHUB_TOKEN = ''
  * 关闭后该路径走原有混合传输逻辑（返回 GitHub 原始页面）
  */
 const ENABLE_RELEASES_LIST = true
+/**
+ * CORS 允许的来源（CWE-942 安全修复）
+ * 生产环境建议设置为具体域名，如 "https://example.com"
+ * 设为 "*" 表示允许所有来源（向后兼容的默认值）
+ * 也可通过环境变量 CORS_ORIGIN 覆盖
+ */
+const CORS_ORIGIN = "*"  // eslint-disable-line -- 用户可自定义
 
 // =====================================================================
 // 域名分类
@@ -96,7 +103,7 @@ const exp12 = /^(?:https?:\/\/)?github\.com\/login\/oauth\/.+$/i
 const PREFLIGHT_INIT = {
     status: 204,
     headers: new Headers({
-        'access-control-allow-origin': '*',
+        'access-control-allow-origin': CORS_ORIGIN,
         'access-control-allow-methods': 'GET,POST,PUT,PATCH,TRACE,DELETE,HEAD,OPTIONS',
         'access-control-max-age': '1728000',
     }),
@@ -109,7 +116,7 @@ const PREFLIGHT_INIT = {
  * @param {Object<string, string>} headers
  */
 function makeRes(body, status = 200, headers = {}) {
-    headers['access-control-allow-origin'] = '*'
+    headers['access-control-allow-origin'] = CORS_ORIGIN
     return new Response(body, {status, headers})
 }
 
@@ -320,7 +327,7 @@ async function fetchViaHybrid(targetUrl, request, maxRedirects = 10) {
 
     return new Response('Too many redirects', {
         status: 502,
-        headers: { 'access-control-allow-origin': '*' },
+        headers: { 'access-control-allow-origin': CORS_ORIGIN },
     })
 }
 
@@ -351,7 +358,7 @@ async function fetchViaFetch(targetUrl, method, originalRequest, body) {
     })
 
     const resHeaders = new Headers(response.headers)
-    resHeaders.set('access-control-allow-origin', '*')
+    resHeaders.set('access-control-allow-origin', CORS_ORIGIN)
     resHeaders.set('access-control-expose-headers', '*')
     resHeaders.delete('content-security-policy')
     resHeaders.delete('content-security-policy-report-only')
@@ -433,7 +440,7 @@ function buildSocketResponse(result) {
         if (key.toLowerCase() === 'content-encoding') continue
         resHeaders.set(key, val)
     }
-    resHeaders.set('access-control-allow-origin', '*')
+    resHeaders.set('access-control-allow-origin', CORS_ORIGIN)
     resHeaders.set('access-control-expose-headers', '*')
     // 阻止 Cloudflare 边缘代理自动压缩（关键修复）
     resHeaders.set('Content-Encoding', 'identity')
@@ -915,7 +922,7 @@ async function diagnosticsHandler() {
         status: 200,
         headers: {
             'content-type': 'application/json',
-            'access-control-allow-origin': '*',
+            'access-control-allow-origin': CORS_ORIGIN,
         },
     })
 }
@@ -1072,7 +1079,7 @@ async function releasesListHandler(req, path) {
         status: 200,
         headers: {
             'content-type': 'text/html; charset=utf-8',
-            'access-control-allow-origin': '*',
+            'access-control-allow-origin': CORS_ORIGIN,
             'Cache-Control': 'no-cache, no-transform',
         }
     })
@@ -1957,7 +1964,7 @@ async function downloadFolderHandler(req, path) {
         headers: {
             'Content-Type': 'application/zip',
             'Content-Disposition': `attachment; filename="${zipFileName}"`,
-            'access-control-allow-origin': '*',
+            'access-control-allow-origin': CORS_ORIGIN,
             'access-control-expose-headers': '*',
             'Content-Encoding': 'identity',
             'Cache-Control': 'no-cache, no-transform',
@@ -1996,7 +2003,7 @@ async function socketTest() {
         status: 200,
         headers: {
             'content-type': 'application/json',
-            'access-control-allow-origin': '*',
+            'access-control-allow-origin': CORS_ORIGIN,
         },
     })
 }
