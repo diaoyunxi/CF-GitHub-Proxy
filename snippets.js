@@ -180,6 +180,18 @@ async function fetchHandler(req) {
     // q 参数重定向
     let path = urlObj.searchParams.get('q')
     if (path) {
+        // 拒绝包含协议分隔符或以 // 开头的路径，防止开放重定向攻击 (CWE-601)
+
+        if (path.includes('://') || path.startsWith('//')
+
+            || path.startsWith('\\') || path.includes('@')
+
+        ) {
+
+            return makeResp('Blocked: invalid redirect path', 403)
+
+        }
+
         return Response.redirect('https://' + urlObj.host + PREFIX + path, 301)
     }
 

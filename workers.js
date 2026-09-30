@@ -179,9 +179,15 @@ async function fetchHandler(req) {
     const urlStr = req.url
     const urlObj = new URL(urlStr)
 
-    // q 参数重定向
+    // q 参数重定向（添加路径校验防止开放重定向 CWE-601）
     let path = urlObj.searchParams.get('q')
     if (path) {
+        // 拒绝包含协议分隔符或以 // 开头的路径，防止开放重定向攻击
+        if (path.includes('://') || path.startsWith('//')
+            || path.startsWith('\\') || path.includes('@')
+        ) {
+            return makeResp('Blocked: invalid redirect path', 403)
+        }
         return Response.redirect('https://' + urlObj.host + PREFIX + path, 301)
     }
 
