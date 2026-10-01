@@ -30,7 +30,7 @@ const ASSET_URL = 'https://diaoyunxi.github.io/CF-GitHub-Proxy/'
 /** 前缀，如自定义路由为 example.com/gh/*，改为 '/gh/' */
 const PREFIX = '/'
 /** 白名单，路径中包含指定字符才通过，如 ['/username/'] */
-const whiteList = []
+const whiteList = [] // 安全建议: 设置为 ['/your-username/'] 限制仅代理指定用户的仓库
 /**
  * GitHub Token（可选，用于文件夹下载的 API 认证，提升速率限制到 5000次/小时）
  * 留空则使用未认证方式（60次/小时/IP）
