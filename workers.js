@@ -179,9 +179,20 @@ async function fetchHandler(req) {
     const urlStr = req.url
     const urlObj = new URL(urlStr)
 
-    // q 参数重定向
+    // q 参数重定向（添加安全检查防止开放重定向攻击）
     let path = urlObj.searchParams.get('q')
     if (path) {
+        // 安全检查：拒绝协议相对 URL 和绝对 URL，防止开放重定向攻击 (CWE-601)
+        if (path.startsWith('//') || path.startsWith('@') || /^https?:\/\//i.test(path)) {
+            return new Response('Invalid redirect path: absolute URLs and protocol-relative URLs are not allowed', { 
+                status: 400,
+                headers: { 'content-type': 'text/plain' }
+            })
+        }
+        // 规范化路径：确保以 / 开头
+        if (!path.startsWith('/')) {
+            path = '/' + path
+        }
         return Response.redirect('https://' + urlObj.host + PREFIX + path, 301)
     }
 
