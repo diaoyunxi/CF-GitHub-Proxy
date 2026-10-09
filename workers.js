@@ -163,7 +163,7 @@ export default {
         try {
             return await fetchHandler(request)
         } catch (err) {
-            return makeRes('cfworker error:\n' + err.stack, 502)
+            return makeRes('Internal Server Error', 502)
         }
     }
 }
