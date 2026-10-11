@@ -1,4 +1,12 @@
 /**
+ * ⚠️ 安全注意事项 (Security Notes):
+ * 1. CORS 使用通配符 '*' 是代理服务的有意设计，生产部署时建议限制为可信域名
+ * 2. Token 可通过 URL 参数 (?token=xxx) 传递，存在浏览器历史/日志/Referer 泄露风险
+ *    建议生产环境仅使用 Authorization 请求头传递 token
+ * 3. whiteList 为空时不做路径过滤，部署时建议配置白名单限制访问范围
+ */
+
+/**
  * CF-Workers-GitHub-Proxy
  * 基于 Cloudflare Workers 的 GitHub 全功能镜像站
  *
