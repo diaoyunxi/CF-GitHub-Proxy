@@ -7,3 +7,8 @@ node_modules/
 # 临时文件
 *.log
 *.tmp
+
+# Environment files (may contain secrets)
+.env
+.env.local
+.env.*.local
