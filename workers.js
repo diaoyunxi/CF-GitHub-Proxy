@@ -65,7 +65,13 @@ const ENABLE_RELEASES_LIST = true
  * 设为 "*" 表示允许所有来源（向后兼容的默认值）
  * 也可通过环境变量 CORS_ORIGIN 覆盖
  */
-const CORS_ORIGIN = "*"  // eslint-disable-line -- 用户可自定义
+const CORS_ORIGIN_DEFAULT = "*"  // eslint-disable-line -- 用户可自定义
+/**
+ * CORS 允许的来源（运行时由 fetch handler 根据环境变量动态设置）
+ * 优先读取 env.CORS_ORIGIN，未配置时回退到 CORS_ORIGIN_DEFAULT
+ * @type {string}
+ */
+let CORS_ORIGIN = CORS_ORIGIN_DEFAULT
 
 // =====================================================================
 // 域名分类
@@ -183,6 +189,8 @@ function canUseFetch(hostname) {
 
 export default {
     async fetch(request, env, ctx) {
+        // 从环境变量读取 CORS_ORIGIN，未配置时使用默认值
+        CORS_ORIGIN = (env && env.CORS_ORIGIN) || CORS_ORIGIN_DEFAULT
         try {
             const response = await fetchHandler(request)
             // 全局安全响应头：防止 MIME 嗅探、点击劫持、信息泄露
